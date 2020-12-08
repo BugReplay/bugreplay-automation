@@ -1,0 +1,11 @@
+{
+  "name": "bugreplay-automation",
+  "version": "1.0.0",
+  "description": "Facilitates the automation of the BugReplay extension for recording automated test suites",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "BugReplay, Inc.",
+  "license": "SEE LICENSE IN LICENSE file"
+}
