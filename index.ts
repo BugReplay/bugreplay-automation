@@ -6,7 +6,7 @@ const dispatch = (payload: any) => {
 }
 
 export const setup = (apiKey: string) => {
-  return new Promise((resolve, reject) => {
+  return new Promise<void>((resolve, reject) => {
     window.addEventListener("message", (event) => {
       if(event?.data?.payload?.nextState?.popup?.activeTab) {
         // Don't finish until the report is submitted and processed
@@ -29,7 +29,7 @@ export const startRecording = () => {
 }
 
 export const stopRecording = () => {
-  return new Promise((resolve, reject) => {
+  return new Promise<void>((resolve, reject) => {
     window.addEventListener("message", (event) => {
       if(event?.data?.payload?.nextState?.recording?.stopped) {
         // Don't finish until the browser has stopped recording
@@ -44,7 +44,7 @@ export const stopRecording = () => {
 }
 
 export const saveRecording = (title:string, options={}) => {
-  return new Promise((resolve, reject) => {
+  return new Promise<void>((resolve, reject) => {
     window.addEventListener("message", (event) => {
       if(!event?.data?.payload?.nextState?.report?.started &&
          event?.data?.payload?.nextState?.reports?.processing?.length === 0
@@ -79,9 +79,15 @@ export const saveRecording = (title:string, options={}) => {
   })
 }
 
+export const cancelRecording = () => {
+    dispatch({ type: 'CANCEL_REPORT' })
+    dispatch({ type: 'POPUP_DISCONNECT' })
+}
+
 export default {
   setup,
   startRecording,
   stopRecording,
-  saveRecording
+  saveRecording,
+  cancelRecording
 }
