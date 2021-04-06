@@ -11,14 +11,14 @@ var __assign = (this && this.__assign) || function () {
     return __assign.apply(this, arguments);
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.saveRecording = exports.stopRecording = exports.startRecording = exports.setup = void 0;
+exports.cancelRecording = exports.saveRecording = exports.stopRecording = exports.startRecording = exports.setup = void 0;
 var dispatch = function (payload) {
     window.postMessage({
         type: 'REDUX_DISPATCH',
         payload: payload
     }, '*');
 };
-exports.setup = function (apiKey) {
+var setup = function (apiKey) {
     return new Promise(function (resolve, reject) {
         window.addEventListener("message", function (event) {
             var _a, _b, _c, _d;
@@ -36,11 +36,13 @@ exports.setup = function (apiKey) {
         });
     });
 };
-exports.startRecording = function () {
+exports.setup = setup;
+var startRecording = function () {
     document.title = "Record This Window";
     dispatch({ type: 'CLICK_START_RECORDING_SCREEN' });
 };
-exports.stopRecording = function () {
+exports.startRecording = startRecording;
+var stopRecording = function () {
     return new Promise(function (resolve, reject) {
         window.addEventListener("message", function (event) {
             var _a, _b, _c, _d;
@@ -55,7 +57,8 @@ exports.stopRecording = function () {
         }, '*');
     });
 };
-exports.saveRecording = function (title, options) {
+exports.stopRecording = stopRecording;
+var saveRecording = function (title, options) {
     if (options === void 0) { options = {}; }
     return new Promise(function (resolve, reject) {
         window.addEventListener("message", function (event) {
@@ -87,9 +90,16 @@ exports.saveRecording = function (title, options) {
         }, '*');
     });
 };
+exports.saveRecording = saveRecording;
+var cancelRecording = function () {
+    dispatch({ type: 'CANCEL_REPORT' });
+    dispatch({ type: 'POPUP_DISCONNECT' });
+};
+exports.cancelRecording = cancelRecording;
 exports.default = {
     setup: exports.setup,
     startRecording: exports.startRecording,
     stopRecording: exports.stopRecording,
-    saveRecording: exports.saveRecording
+    saveRecording: exports.saveRecording,
+    cancelRecording: exports.cancelRecording
 };

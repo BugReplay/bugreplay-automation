@@ -25,6 +25,14 @@ function actions(dispatch) {
             type: 'USER_INFO_RETRIEVAL_SUCCESS',
             payload: { userInfoResponse },
         }),
+        trialStatusRetrievalSuccess: trialStatusResponse => dispatch({
+            type: 'TRIAL_STATUS_RETRIEVAL_SUCCESS',
+            payload: { trialStatusResponse },
+        }),
+        trialStatusRetrievalFailure: error => dispatch({
+            type: 'TRIAL_STATUS_RETRIEVAL_FAILURE',
+            payload: { error },
+        }),
         fbbTokenInfoRetrievalSuccess: fbbTokenResponse => dispatch({
             type: 'FBB_TOKEN_INFO_RETRIEVAL_SUCCESS',
             payload: { fbbTokenResponse },
@@ -64,13 +72,14 @@ function actions(dispatch) {
                 clientUrl,
             },
         }),
-        reportProcessingSuccess: (processingId, processedReport, networkTrafficUploadError, uploadedSourceMapHashErrors) => dispatch({
+        reportProcessingSuccess: (processingId, processedReport, networkTrafficUploadError
+        // uploadedSourceMapHashErrors
+        ) => dispatch({
             type: 'REPORT_PROCESSING_SUCCESS',
             payload: {
                 processingId,
                 processedReport,
                 networkTrafficUploadError,
-                uploadedSourceMapHashErrors,
             },
         }),
         reportProcessingFailure: (processingId, error) => dispatch({
@@ -141,6 +150,7 @@ const URI = require("urijs");
 const lodash_1 = require("lodash");
 const jwt_decode = require("jwt-decode");
 function handleBugReplayJson(json) {
+    console.log('---> JSON: ' + JSON.stringify(json));
     if (!json.success) {
         throw json.error[0];
     }
@@ -199,6 +209,10 @@ function api(window, settings) {
                 ? `${path}&v=${settings.extensionVersion}`
                 : `${path}?v=${settings.extensionVersion}`));
     };
+    const clearTokens = () => {
+        chrome.cookies.remove({ name: 'br_access_token', url: window.baseUrl });
+        chrome.cookies.remove({ name: 'br_refresh_token', url: window.baseUrl });
+    };
     function refreshTokens(accessToken, refreshToken) {
         return __awaiter(this, void 0, void 0, function* () {
             return new Promise((resolve, reject) => {
@@ -209,9 +223,18 @@ function api(window, settings) {
                             jqXHR.setRequestHeader('Authorization', `Bearer ${accessToken}`);
                     },
                     success: (_, __, jqXHR) => {
+                        if (jqXHR.responseJSON.error &&
+                            Array.isArray(jqXHR.responseJSON.error) &&
+                            jqXHR.responseJSON.error[0].message === 'Token is expired') {
+                            clearTokens();
+                            reject(jqXHR.responseJSON.error[0].message);
+                        }
                         resolve(jqXHR.responseJSON.data.access_token);
                     },
-                    error: reject,
+                    error: (jqXHR, textStatus, errorThrown) => {
+                        clearTokens();
+                        reject(errorThrown);
+                    },
                     url: urlFor('/api/auth/refresh'),
                     method: 'POST',
                     data: { refresh_token: refreshToken },
@@ -257,13 +280,16 @@ function api(window, settings) {
         return __awaiter(this, void 0, void 0, function* () {
             const url = urlFor(path);
             const fbbext = window.fbbext;
+            const standalone = window.standalone;
             let accessToken = '';
-            try {
-                accessToken = yield getAccessToken();
-            }
-            catch (error) {
-                console.log(error);
-                console.log('Here in catch error. No token found. User is not logged in unless there is an old style token around');
+            if (!standalone) {
+                try {
+                    accessToken = yield getAccessToken();
+                }
+                catch (error) {
+                    console.log(error);
+                    console.log('Here in catch error. No token found. User is not logged in unless there is an old style token around');
+                }
             }
             // Header either has Bearer if a token is present from the new br_ token cookies
             // or it is not, in which case it will fallback on the old user_session and sessions_available
@@ -316,6 +342,17 @@ function api(window, settings) {
             }
         });
     }
+    function getCurrentTrialStatus() {
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                const trialStatusReponse = yield fetchBugreplay('/api/client/trial_status');
+                return trialStatusReponse;
+            }
+            catch (error) {
+                throw error;
+            }
+        });
+    }
     function fbbToken(apiKey, feedbackSessionTokenId) {
         return __awaiter(this, void 0, void 0, function* () {
             return new Promise((resolve, reject) => {
@@ -352,7 +389,7 @@ function api(window, settings) {
         return __awaiter(this, void 0, void 0, function* () {
             try {
                 const fbbApiKey = getFbbApiKey();
-                if (fbbApiKey) {
+                if (fbbApiKey.key) {
                     const apiKey = fbbApiKey.key;
                     const mode = fbbApiKey.mode;
                     const externalReportJwt = yield fbbToken(apiKey);
@@ -397,13 +434,16 @@ function api(window, settings) {
     function wrappedAjax(opts) {
         return __awaiter(this, void 0, void 0, function* () {
             const fbbext = window.fbbext;
+            const standalone = window.standalone;
             let fbbTokenResponse;
             let accessToken = '';
-            if (fbbext) {
-                fbbTokenResponse = yield getFbbTokenInfo();
-            }
-            else {
-                accessToken = yield getAccessToken();
+            if (!standalone) {
+                if (fbbext) {
+                    fbbTokenResponse = yield getFbbTokenInfo();
+                }
+                else {
+                    accessToken = yield getAccessToken();
+                }
             }
             // tslint:disable-next-line: typedef
             function makeRequest() {
@@ -462,16 +502,38 @@ function api(window, settings) {
     };
     function uploadAsset(asset_type, blob) {
         return __awaiter(this, void 0, void 0, function* () {
+            const standalone = window.standalone;
             const { jwt, upload_link } = yield postAjax('/api/asset/get_upload_link', {
                 asset_type,
                 file_size: blob.size,
             }, {
                 errorMessageForUser: `Failed to upload ${prettyAssetNames[asset_type]}. Your report may appear corrupted.`,
             });
-            yield uploadToStorage(upload_link, blob);
+            if (standalone) {
+                const blob64 = yield blobToBase64(blob);
+                yield postAjax('/api/asset/save_asset', {
+                    url: upload_link,
+                    data: blob64,
+                }, {
+                    errorMessageForUser: `Failed to save local assets'
+            }. Your report may appear corrupted.`,
+                });
+            }
+            else {
+                yield uploadToStorage(upload_link, blob);
+            }
             return { jwt };
         });
     }
+    const blobToBase64 = blob => {
+        const reader = new FileReader();
+        reader.readAsDataURL(blob);
+        return new Promise(resolve => {
+            reader.onloadend = () => {
+                resolve(reader.result);
+            };
+        });
+    };
     function uploadToStorage(url, data) {
         return __awaiter(this, void 0, void 0, function* () {
             return new Promise((resolve, reject) => {
@@ -485,6 +547,7 @@ function api(window, settings) {
                     contentType: false,
                 });
             });
+            // }
         });
     }
     function uploadVideo(videoBlob) {
@@ -824,6 +887,7 @@ function api(window, settings) {
     return {
         getFbbTokenInfo,
         getUserInfo,
+        getCurrentTrialStatus,
         getReports,
         uploadRecordingAssets,
         uploadScreenshot,
@@ -859,6 +923,19 @@ const settings_1 = require("./settings");
 const Api = api_1.api(window, settings_1.settings);
 // Attach the store to the window so the popup can access it
 const store = (window.store = store_1.createStore(settings_1.settings, Api));
+chrome.runtime.onConnectExternal.addListener(port => {
+    if (port.name !== 'feedbackControllerPort')
+        return;
+    port.onMessage.addListener((msg) => {
+        if (msg.name === 'activateSession') {
+            api_2.setFbbApiKey(msg.apiKey, 'zendesk');
+            store.dispatch({
+                type: 'SET_ZENDESK_PORT',
+                payload: { zendeskPort: port },
+            });
+        }
+    });
+});
 chrome.runtime.onMessage.addListener(function (message) {
     if (message.type === 'REDUX_DISPATCH') {
         store.dispatch(message.payload);
@@ -885,7 +962,10 @@ if (!browser_detection_1.capabilities.isFirefox) {
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.explanation = message => message.endsWith('.') || message.endsWith('!') ? message : `${message}.`;
-exports.clientOffline = 'You seem to be offline. Please check your internet connection and try again.';
+const standalone = window.standalone;
+exports.clientOffline = standalone
+    ? 'Your BugReplay Desktop app does not appear to be running. Please start your BugReplay Desktop app and reopen this popup to start recording.'
+    : 'You seem to be offline. Please check your internet connection and try again.';
 exports.serverDown = exports.explanation('Cannot connect to server.');
 exports.unknown = 'Something went wrong. Please retry.';
 
@@ -1279,11 +1359,8 @@ const toLog = new Set([
     'webSocketFrameSent',
     'eventSourceMessageReceived',
 ]);
-function createChromeNetworkRecorder(tabId, chrome, onNetworkError) {
-    const requests = new Map();
-    const harEntries = new Map();
-    let buffer = ''; // tslint:disable-line:no-let
-    let har = {
+function initHARData() {
+    return {
         log: {
             version: '1.2',
             creator: {
@@ -1293,6 +1370,62 @@ function createChromeNetworkRecorder(tabId, chrome, onNetworkError) {
             pages: [],
         },
     };
+}
+function isEmpty(o) {
+    return !o;
+}
+function getHeaderValue(headers, header) {
+    if (!headers) {
+        return '';
+    }
+    // http header names are case insensitive
+    const lowerCaseHeader = header.toLowerCase();
+    const headerNames = Object.keys(headers);
+    return (headerNames
+        .filter(key => key.toLowerCase() === lowerCaseHeader)
+        .map(key => headers[key])
+        .shift() || '');
+}
+function parsePostData(contentType, postData) {
+    if (isEmpty(contentType) || isEmpty(postData)) {
+        return undefined;
+    }
+    try {
+        if (/^application\/x-www-form-urlencoded/.test(contentType)) {
+            return {
+                mimeType: contentType,
+                params: this.parseUrlEncoded(postData),
+            };
+        }
+        if (/^application\/json/.test(contentType)) {
+            return {
+                mimeType: contentType,
+                params: this.toNameValuePairs(JSON.parse(postData)),
+            };
+        }
+        // FIXME parse multipart/form-data as well.
+    }
+    catch (e) {
+        // debug(`Unable to parse post data '${postData}' of type ${contentType}`);
+        // Fall back to include postData as text.
+    }
+    return {
+        mimeType: contentType,
+        text: postData,
+    };
+}
+function formatIP(ipAddress) {
+    if (typeof ipAddress !== 'string') {
+        return undefined;
+    }
+    // IPv6 addresses are listed as [2a00:1450:400f:80a::2003]
+    return ipAddress.replace(/^\[|]$/g, '');
+}
+function createChromeNetworkRecorder(tabId, chrome, onNetworkError) {
+    const requests = new Map();
+    const harEntries = new Map();
+    const har = initHARData();
+    let buffer = ''; // tslint:disable-line:no-let
     const log = (type, data) => (buffer += JSON.stringify({ type, data }));
     function onEvent(type, data) {
         if (type === 'requestWillBeSent') {
@@ -1304,19 +1437,19 @@ function createChromeNetworkRecorder(tabId, chrome, onNetworkError) {
         const { requestId } = data;
         switch (type) {
             case 'requestWillBeSentExtraInfo': {
-                let requestData = harEntries.get(requestId) || {};
+                const requestData = harEntries.get(requestId) || {};
                 if (data && data.associatedCookies) {
                     requestData['request'] = requestData['request'] || {};
                     requestData.request.cookies = [];
                     data.associatedCookies.forEach(cookie => {
-                        if (cookie.blockedReasons.length == 0) {
+                        if (cookie.blockedReasons.length === 0) {
                             requestData.request.cookies.push(cookie.cookie);
                         }
                     });
                 }
                 if (data.headers) {
                     requestData.request.headers = requestData.request.headers || [];
-                    for (var key in data.headers) {
+                    for (const key in data.headers) {
                         requestData.request.headers.push({
                             name: key,
                             value: data.headers[key],
@@ -1368,7 +1501,7 @@ function createChromeNetworkRecorder(tabId, chrome, onNetworkError) {
                             .reduce((a, b) => a + b, 0);
                     }
                     if (data.response && data.response.headers) {
-                        for (var key in data.response.headers) {
+                        for (const key in data.response.headers) {
                             requestData.response.headers.push({
                                 name: key,
                                 value: data.response.headers[key],
@@ -1381,7 +1514,7 @@ function createChromeNetworkRecorder(tabId, chrome, onNetworkError) {
             }
             case 'requestWillBeSent': {
                 requests.set(requestId, data);
-                let requestData = harEntries.get(requestId) || {};
+                const requestData = harEntries.get(requestId) || {};
                 requestData['request'] = requestData['request'] || {};
                 requestData.response = {};
                 requestData.cache = {};
@@ -1407,7 +1540,7 @@ function createChromeNetworkRecorder(tabId, chrome, onNetworkError) {
                     ? 0
                     : requestData.request.postData.length;
                 if (data.request.headers) {
-                    for (var key in data.request.headers) {
+                    for (const key in data.request.headers) {
                         requestData.request.headers.push({
                             name: key,
                             value: data.request.headers[key],
@@ -1416,7 +1549,7 @@ function createChromeNetworkRecorder(tabId, chrome, onNetworkError) {
                 }
                 harEntries.set(requestId, requestData);
                 if (data.request.hasPostData) {
-                    let requestData = harEntries.get(requestId);
+                    const requestData = harEntries.get(requestId);
                     requestData.request.postData = parsePostData(getHeaderValue(data.request.headers, 'Content-Type'), data.request.postData);
                     harEntries.set(requestId, requestData);
                 }
@@ -1430,7 +1563,7 @@ function createChromeNetworkRecorder(tabId, chrome, onNetworkError) {
                 const request = requests.get(requestId);
                 if (!request)
                     return;
-                if (request.type !== 'XHR') {
+                if (request.type !== 'XHR' && request.type !== 'Fetch') {
                     requests.delete(requestId);
                     return;
                 }
@@ -1439,7 +1572,8 @@ function createChromeNetworkRecorder(tabId, chrome, onNetworkError) {
                         const { message } = chrome.runtime.lastError;
                         // If the user stops recording while this command is being processed, we don't care.
                         if (message === 'Detached while handling command.' ||
-                            message.includes('No resource with given identifier found')) {
+                            message.includes('No resource with given identifier found') ||
+                            message.includes('No data found for resource')) {
                             return;
                         }
                         return onNetworkError(chrome.runtime.lastError);
@@ -1457,13 +1591,6 @@ function createChromeNetworkRecorder(tabId, chrome, onNetworkError) {
         });
         return { buffer, har };
     }
-    function formatIP(ipAddress) {
-        if (typeof ipAddress !== 'string') {
-            return undefined;
-        }
-        // IPv6 addresses are listed as [2a00:1450:400f:80a::2003]
-        return ipAddress.replace(/^\[|]$/g, '');
-    }
     function formatMillis(time, fractionalDigits = 3) {
         return Number(Number(time).toFixed(fractionalDigits));
     }
@@ -1473,51 +1600,8 @@ function createChromeNetworkRecorder(tabId, chrome, onNetworkError) {
         }
         return -1;
     }
-    function getHeaderValue(headers, header) {
-        if (!headers) {
-            return '';
-        }
-        // http header names are case insensitive
-        const lowerCaseHeader = header.toLowerCase();
-        const headerNames = Object.keys(headers);
-        return (headerNames
-            .filter(key => key.toLowerCase() === lowerCaseHeader)
-            .map(key => headers[key])
-            .shift() || '');
-    }
-    function isEmpty(o) {
-        return !o;
-    }
     function isHttp1x(version) {
         return version.toLowerCase().startsWith('http/1.');
-    }
-    function parsePostData(contentType, postData) {
-        if (isEmpty(contentType) || isEmpty(postData)) {
-            return undefined;
-        }
-        try {
-            if (/^application\/x-www-form-urlencoded/.test(contentType)) {
-                return {
-                    mimeType: contentType,
-                    params: this.parseUrlEncoded(postData),
-                };
-            }
-            if (/^application\/json/.test(contentType)) {
-                return {
-                    mimeType: contentType,
-                    params: this.toNameValuePairs(JSON.parse(postData)),
-                };
-            }
-            // FIXME parse multipart/form-data as well.
-        }
-        catch (e) {
-            // debug(`Unable to parse post data '${postData}' of type ${contentType}`);
-            // Fall back to include postData as text.
-        }
-        return {
-            mimeType: contentType,
-            text: postData,
-        };
     }
     function firstNonNegative(values) {
         for (let i = 0; i < values.length; ++i) {
@@ -1534,6 +1618,8 @@ function createChromeNetworkRecorder(tabId, chrome, onNetworkError) {
 exports.createChromeNetworkRecorder = createChromeNetworkRecorder;
 function createFirefoxNetworkRecorder(browser, tabId) {
     const requests = new Map();
+    const harEntries = new Map();
+    const har = initHARData();
     let buffer = '';
     let started = false;
     function start() {
@@ -1546,6 +1632,27 @@ function createFirefoxNetworkRecorder(browser, tabId) {
     };
     function onBeforeRequest(info) {
         requests.set(info.requestId, info);
+        const requestData = {
+            request: {
+                cookies: [],
+                headers: [],
+            },
+        };
+        harEntries.set(info.requestId, requestData);
+    }
+    function responseBodyListener(info) {
+        const { requestId } = info;
+        const filter = browser.webRequest.filterResponseData(requestId);
+        const decoder = new TextDecoder('utf-8');
+        const encoder = new TextEncoder();
+        filter.ondata = event => {
+            const responseJson = decoder.decode(event.data, { stream: true });
+            const data = { base64Encoded: false, body: responseJson };
+            log('responseBody', { requestId, data });
+            filter.write(encoder.encode(responseJson));
+            filter.disconnect();
+        };
+        return {};
     }
     function webrequestToRequestWillBeSent(info) {
         const req = {
@@ -1554,9 +1661,45 @@ function createFirefoxNetworkRecorder(browser, tabId) {
             method: info.method,
             initialPriority: '',
         };
+        const requestData = harEntries.get(info.requestId) || {};
+        requestData.time = 0;
+        requestData.cache = {};
+        requestData.timings = {
+            blocked: -1,
+            dns: -1,
+            connect: -1,
+            send: 0,
+            wait: 0,
+            receive: 0,
+            ssl: -1,
+        };
+        requestData.startedDateTime = new Date(info.timeStamp).toISOString();
+        requestData.request.url = info.url;
+        requestData.request.method = info.method;
+        requestData.request.headers = info.headers;
+        requestData.request.httpVersion = '';
+        requestData.request.cookies = requestData.request.cookies || [];
+        requestData.request.queryString = [];
+        requestData.request.headersSize = -1;
+        requestData.response = {
+            cookies: [],
+            headers: [],
+            content: {},
+        };
         if (info.requestBody) {
             req.encodedPostData = info.requestBody;
+            if (info.requestBody.raw) {
+                req.postData = decodeURIComponent(String.fromCharCode.apply(null, new Uint8Array(info.requestBody.raw[0].bytes)));
+                requestData.request.postData = parsePostData(getHeaderValue(req.headers, 'Content-Type'), req.postData);
+            }
+            else if (info.requestBody.formData) {
+                const object = {};
+                info.requestBody.formData.forEach((value, key) => (object[key] = value));
+                req.postData = JSON.stringify(object);
+                requestData.request.postData = parsePostData(getHeaderValue(req.headers, 'Content-Type'), req.postData);
+            }
         }
+        harEntries.set(info.requestId, requestData);
         return {
             requestId: info.requestId,
             timestamp: info.timeStamp / 1000,
@@ -1597,6 +1740,13 @@ function createFirefoxNetworkRecorder(browser, tabId) {
             encodedDataLength: 0,
             securityState: '',
         };
+        const requestData = harEntries.get(info.requestId) || {};
+        requestData.serverIPAddress = formatIP(info.ip);
+        requestData.response.headers = info.headers;
+        requestData.response.status = info.statusCode;
+        requestData.response.statusText = info.statusLine;
+        requestData.response.content.mimeType = mimeType;
+        harEntries.set(info.requestId, requestData);
         return {
             response: resp,
             requestId: info.requestId,
@@ -1626,6 +1776,7 @@ function createFirefoxNetworkRecorder(browser, tabId) {
         log('loadingFinished', webrequestToLoadingFinished(info));
     }
     browser.webRequest.onBeforeRequest.addListener(onBeforeRequest, { tabId, urls: ['<all_urls>'] }, ['requestBody']);
+    browser.webRequest.onBeforeRequest.addListener(responseBodyListener, { tabId, urls: ['<all_urls>'], types: ['xmlhttprequest'] }, ['blocking']);
     browser.webRequest.onSendHeaders.addListener(onSendHeaders, { tabId, urls: ['<all_urls>'] }, ['requestHeaders']);
     browser.webRequest.onHeadersReceived.addListener(onHeadersReceived, { tabId, urls: ['<all_urls>'] }, ['responseHeaders']);
     browser.webRequest.onCompleted.addListener(onCompleted, {
@@ -1634,10 +1785,16 @@ function createFirefoxNetworkRecorder(browser, tabId) {
     });
     const stop = lodash_1.once(() => {
         browser.webRequest.onBeforeRequest.removeListener(onBeforeRequest);
+        browser.webRequest.onBeforeRequest.removeListener(responseBodyListener);
         browser.webRequest.onSendHeaders.removeListener(onSendHeaders);
         browser.webRequest.onHeadersReceived.removeListener(onHeadersReceived);
         browser.webRequest.onCompleted.removeListener(onCompleted);
-        return { buffer, har: {} };
+        har['log']['entries'] = Array.from(harEntries.values()).filter(function (x) {
+            if (x.response) {
+                return Object.keys(x.response).length > 0;
+            }
+        });
+        return { buffer, har };
     });
     return {
         start,
@@ -2263,7 +2420,6 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-const lodash_1 = require("lodash");
 function uploadRecordingAssetsAheadOfTime(recorders, api, dispatchBackgroundActions) {
     const uploadingAssets = api.uploadRecordingAssets(recorders);
     dispatchBackgroundActions.uploadingAssets(uploadingAssets);
@@ -2344,22 +2500,34 @@ function doSubmitReport(navigator, report, api, settings, dispatchBackgroundActi
         }
         if (!fbbext) {
             reportData['project_id'] = report.details.project_id;
+            if (report.details.assigned_user_id) {
+                reportData['assigned_user_id'] = report.details.assigned_user_id;
+            }
+            if (report.details.status_id) {
+                reportData['status_id'] = report.details.status_id;
+            }
+            if (report.details.tags) {
+                reportData['tags'] = report.details.tags;
+            }
         }
         const createdReport = yield api.createReport(reportData);
         const { report_id } = createdReport.report;
         const { client_url } = createdReport;
         setReportId(report_id);
         dispatchBackgroundActions.submitReportSuccess(report.processingId, client_url);
-        const uploadingSourceMapHash = lodash_1.isEmpty(sourceMapHash)
-            ? Promise.resolve({ jwts: [], errors: [] })
-            : api.uploadSourceMaps(sourceMapHash);
+        // const uploadingSourceMapHash: Promise<{
+        //   jwts: ReadonlyArray<string>
+        //   errors: ReadonlyArray<any>
+        // }> = isEmpty(sourceMapHash)
+        //   ? Promise.resolve({ jwts: [], errors: [] })
+        //   : api.uploadSourceMaps(sourceMapHash)
         const creatingJiraTicket = report.details.jira &&
             report.details.jira.createTicket &&
             api.createJiraTicket(report_id, report.details.jira);
         const creatingTrelloCard = report.details.trello &&
             report.details.trello.createCard &&
             api.createTrelloCard(report_id, report.details.trello);
-        const uploadedSourceMapHash = yield uploadingSourceMapHash;
+        // const uploadedSourceMapHash = await uploadingSourceMapHash
         yield creatingJiraTicket;
         yield creatingTrelloCard;
         if (!fbbext) {
@@ -2367,14 +2535,12 @@ function doSubmitReport(navigator, report, api, settings, dispatchBackgroundActi
             return {
                 processedReport,
                 networkTrafficUploadError,
-                uploadedSourceMapHashErrors: uploadedSourceMapHash.errors,
             };
         }
         else {
             return {
                 processedReport: createdReport.report,
                 networkTrafficUploadError,
-                uploadedSourceMapHashErrors: uploadedSourceMapHash.errors,
             };
         }
     });
@@ -2384,13 +2550,15 @@ function submitReport(navigator, report, api, settings, dispatchBackgroundAction
     return __awaiter(this, void 0, void 0, function* () {
         let report_id;
         try {
-            const { processedReport, networkTrafficUploadError, uploadedSourceMapHashErrors, } = yield Promise.race([
+            const { processedReport, networkTrafficUploadError, } = yield Promise.race([
                 doSubmitReport(navigator, report, api, settings, dispatchBackgroundActions, r => {
                     report_id = r;
                 }),
                 new Promise((_resolve, reject) => setTimeout(() => reject({ message: 'Timed out creating report.' }), settings.maxSecondsProcessing * 1000)),
             ]);
-            dispatchBackgroundActions.reportProcessingSuccess(report.processingId, processedReport, networkTrafficUploadError, uploadedSourceMapHashErrors);
+            dispatchBackgroundActions.reportProcessingSuccess(report.processingId, processedReport, networkTrafficUploadError
+            // uploadedSourceMapHashErrors
+            );
         }
         catch (error) {
             if (report_id) {
@@ -2402,7 +2570,7 @@ function submitReport(navigator, report, api, settings, dispatchBackgroundAction
 }
 exports.submitReport = submitReport;
 
-},{"lodash":28}],14:[function(require,module,exports){
+},{}],14:[function(require,module,exports){
 "use strict";
 var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
     function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
@@ -2494,7 +2662,7 @@ exports.settings = {
     maxReportsToShow: 5,
     uploadRecordingAssetsAheadOfTime: true,
     isTestEnvironment: false,
-    maxSecondsProcessing: 15 * 60,
+    maxSecondsProcessing: 30 * 60,
     extensionVersion: getExtensionVersion(),
 };
 
@@ -2516,6 +2684,7 @@ const emptyState = {
         fetchedFromServer: false,
     },
     userInfoResponse: null,
+    trialStatusResponse: null,
     screenshot: {
         requestedByUser: false,
         screenshots: [],
@@ -2787,6 +2956,12 @@ function reducer(settings, api, initialState = emptyState, action) {
         case 'USER_INFO_RETRIEVAL_SUCCESS': {
             return Object.assign(Object.assign({}, initialState), { userInfoResponse: action.payload.userInfoResponse });
         }
+        case 'TRIAL_STATUS_RETRIEVAL_SUCCESS': {
+            return Object.assign(Object.assign({}, initialState), { trialStatusResponse: action.payload.trialStatusResponse });
+        }
+        case 'TRIAL_STATUS_RETRIEVAL_FAILURE': {
+            return Object.assign(Object.assign({}, initialState), { alert: logErrorAndReturnCopyForUser(settings, api, initialState, action) });
+        }
         case 'FBB_TOKEN_INFO_RETRIEVAL_SUCCESS': {
             return Object.assign(Object.assign({}, initialState), { fbbTokenResponse: action.payload.fbbTokenResponse });
         }
@@ -2847,12 +3022,12 @@ function reducer(settings, api, initialState = emptyState, action) {
                 alert = 'Warning: network traffic data was too large to upload';
             }
             // Similarly, log errors from uploading source maps, but don't even consider these to be warnings
-            action.payload.uploadedSourceMapHashErrors.forEach(error => {
-                logErrorAndReturnCopyForUser(settings, api, initialState, {
-                    type: action.type,
-                    payload: { error },
-                });
-            });
+            // action.payload.uploadedSourceMapHashErrors.forEach(error => {
+            //   logErrorAndReturnCopyForUser(settings, api, initialState, {
+            //     type: action.type,
+            //     payload: { error },
+            //   })
+            // })
             if (action.payload.processedReport &&
                 action.payload.processedReport.report_type === 'External') {
                 chrome.cookies.remove({ url: window.baseUrl, name: 'br_fbb' });
@@ -2979,6 +3154,7 @@ function subscribe(baseUrl, apiBaseUrl, settings, store, navigator, screen, brow
             else {
                 tab_1.checkActiveTab(tabs, dispatchBackgroundActions);
                 user_1.checkUserInfo(api, dispatchBackgroundActions);
+                user_1.checkCurrentTrialStatus(api, dispatchBackgroundActions);
                 reports_1.checkReports(api, dispatchBackgroundActions);
                 integrations_1.checkIntegrations(api, dispatchBackgroundActions);
             }
@@ -3104,6 +3280,13 @@ function getCPU(chrome) {
 function getZoomInfo(tabs, tabId) {
     return tabs.getZoom(tabId);
 }
+function getScreenSize() {
+    const screen = window.screen;
+    return `${screen.width} X ${screen.height}`;
+}
+function getWindowSize(tab) {
+    return Promise.resolve(`${tab.width} X ${tab.height}`);
+}
 function getSystemInfo(navigator, chrome, tabs, tab) {
     return __awaiter(this, void 0, void 0, function* () {
         const d = new Date();
@@ -3111,6 +3294,7 @@ function getSystemInfo(navigator, chrome, tabs, tab) {
         const gettingStorage = getStorage(chrome);
         const gettingCPU = getCPU(chrome);
         const gettingZoomInfo = getZoomInfo(tabs, tab.id);
+        const gettingWindowSize = getWindowSize(tab);
         return {
             user_agent: navigator.userAgent,
             online: navigator.onLine,
@@ -3123,6 +3307,8 @@ function getSystemInfo(navigator, chrome, tabs, tab) {
             storage: yield gettingStorage,
             cpu: yield gettingCPU,
             zoom: yield gettingZoomInfo,
+            screen_size: getScreenSize(),
+            window_size: yield gettingWindowSize,
         };
     });
 }
@@ -3265,6 +3451,18 @@ function checkUserInfo(api, dispatchBackgroundActions) {
     });
 }
 exports.checkUserInfo = checkUserInfo;
+function checkCurrentTrialStatus(api, dispatchBackgroundActions) {
+    return __awaiter(this, void 0, void 0, function* () {
+        try {
+            const trialStatusReponse = yield api.getCurrentTrialStatus();
+            dispatchBackgroundActions.trialStatusRetrievalSuccess(trialStatusReponse);
+        }
+        catch (error) {
+            dispatchBackgroundActions.trialStatusRetrievalFailure(error);
+        }
+    });
+}
+exports.checkCurrentTrialStatus = checkCurrentTrialStatus;
 
 },{}],23:[function(require,module,exports){
 "use strict";
@@ -3439,7 +3637,7 @@ module.exports = function (token,options) {
 module.exports.InvalidTokenError = InvalidTokenError;
 
 },{"./base64_url_decode":26}],28:[function(require,module,exports){
-(function (global){
+(function (global){(function (){
 /**
  * @license
  * Lodash <https://lodash.com/>
@@ -3454,7 +3652,7 @@ module.exports.InvalidTokenError = InvalidTokenError;
   var undefined;
 
   /** Used as the semantic version number. */
-  var VERSION = '4.17.15';
+  var VERSION = '4.17.20';
 
   /** Used as the size to enable large array optimizations. */
   var LARGE_ARRAY_SIZE = 200;
@@ -7161,8 +7359,21 @@ module.exports.InvalidTokenError = InvalidTokenError;
      * @returns {Array} Returns the new sorted array.
      */
     function baseOrderBy(collection, iteratees, orders) {
+      if (iteratees.length) {
+        iteratees = arrayMap(iteratees, function(iteratee) {
+          if (isArray(iteratee)) {
+            return function(value) {
+              return baseGet(value, iteratee.length === 1 ? iteratee[0] : iteratee);
+            }
+          }
+          return iteratee;
+        });
+      } else {
+        iteratees = [identity];
+      }
+
       var index = -1;
-      iteratees = arrayMap(iteratees.length ? iteratees : [identity], baseUnary(getIteratee()));
+      iteratees = arrayMap(iteratees, baseUnary(getIteratee()));
 
       var result = baseMap(collection, function(value, key, collection) {
         var criteria = arrayMap(iteratees, function(iteratee) {
@@ -7419,6 +7630,10 @@ module.exports.InvalidTokenError = InvalidTokenError;
         var key = toKey(path[index]),
             newValue = value;
 
+        if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
+          return object;
+        }
+
         if (index != lastIndex) {
           var objValue = nested[key];
           newValue = customizer ? customizer(objValue, key, nested) : undefined;
@@ -7571,11 +7786,14 @@ module.exports.InvalidTokenError = InvalidTokenError;
      *  into `array`.
      */
     function baseSortedIndexBy(array, value, iteratee, retHighest) {
-      value = iteratee(value);
-
       var low = 0,
-          high = array == null ? 0 : array.length,
-          valIsNaN = value !== value,
+          high = array == null ? 0 : array.length;
+      if (high === 0) {
+        return 0;
+      }
+
+      value = iteratee(value);
+      var valIsNaN = value !== value,
           valIsNull = value === null,
           valIsSymbol = isSymbol(value),
           valIsUndefined = value === undefined;
@@ -9060,10 +9278,11 @@ module.exports.InvalidTokenError = InvalidTokenError;
       if (arrLength != othLength && !(isPartial && othLength > arrLength)) {
         return false;
       }
-      // Assume cyclic values are equal.
-      var stacked = stack.get(array);
-      if (stacked && stack.get(other)) {
-        return stacked == other;
+      // Check that cyclic values are equal.
+      var arrStacked = stack.get(array);
+      var othStacked = stack.get(other);
+      if (arrStacked && othStacked) {
+        return arrStacked == other && othStacked == array;
       }
       var index = -1,
           result = true,
@@ -9225,10 +9444,11 @@ module.exports.InvalidTokenError = InvalidTokenError;
           return false;
         }
       }
-      // Assume cyclic values are equal.
-      var stacked = stack.get(object);
-      if (stacked && stack.get(other)) {
-        return stacked == other;
+      // Check that cyclic values are equal.
+      var objStacked = stack.get(object);
+      var othStacked = stack.get(other);
+      if (objStacked && othStacked) {
+        return objStacked == other && othStacked == object;
       }
       var result = true;
       stack.set(object, other);
@@ -12609,6 +12829,10 @@ module.exports.InvalidTokenError = InvalidTokenError;
      * // The `_.property` iteratee shorthand.
      * _.filter(users, 'active');
      * // => objects for ['barney']
+     *
+     * // Combining several predicates using `_.overEvery` or `_.overSome`.
+     * _.filter(users, _.overSome([{ 'age': 36 }, ['age', 40]]));
+     * // => objects for ['fred', 'barney']
      */
     function filter(collection, predicate) {
       var func = isArray(collection) ? arrayFilter : baseFilter;
@@ -13358,15 +13582,15 @@ module.exports.InvalidTokenError = InvalidTokenError;
      * var users = [
      *   { 'user': 'fred',   'age': 48 },
      *   { 'user': 'barney', 'age': 36 },
-     *   { 'user': 'fred',   'age': 40 },
+     *   { 'user': 'fred',   'age': 30 },
      *   { 'user': 'barney', 'age': 34 }
      * ];
      *
      * _.sortBy(users, [function(o) { return o.user; }]);
-     * // => objects for [['barney', 36], ['barney', 34], ['fred', 48], ['fred', 40]]
+     * // => objects for [['barney', 36], ['barney', 34], ['fred', 48], ['fred', 30]]
      *
      * _.sortBy(users, ['user', 'age']);
-     * // => objects for [['barney', 34], ['barney', 36], ['fred', 40], ['fred', 48]]
+     * // => objects for [['barney', 34], ['barney', 36], ['fred', 30], ['fred', 48]]
      */
     var sortBy = baseRest(function(collection, iteratees) {
       if (collection == null) {
@@ -18241,11 +18465,11 @@ module.exports.InvalidTokenError = InvalidTokenError;
 
       // Use a sourceURL for easier debugging.
       // The sourceURL gets injected into the source that's eval-ed, so be careful
-      // with lookup (in case of e.g. prototype pollution), and strip newlines if any.
-      // A newline wouldn't be a valid sourceURL anyway, and it'd enable code injection.
+      // to normalize all kinds of whitespace, so e.g. newlines (and unicode versions of it) can't sneak in
+      // and escape the comment, thus injecting code that gets evaled.
       var sourceURL = '//# sourceURL=' +
         (hasOwnProperty.call(options, 'sourceURL')
-          ? (options.sourceURL + '').replace(/[\r\n]/g, ' ')
+          ? (options.sourceURL + '').replace(/\s/g, ' ')
           : ('lodash.templateSources[' + (++templateCounter) + ']')
         ) + '\n';
 
@@ -18278,8 +18502,6 @@ module.exports.InvalidTokenError = InvalidTokenError;
 
       // If `variable` is not specified wrap a with-statement around the generated
       // code to add the data object to the top of the scope chain.
-      // Like with sourceURL, we take care to not check the option's prototype,
-      // as this configuration is a code injection vector.
       var variable = hasOwnProperty.call(options, 'variable') && options.variable;
       if (!variable) {
         source = 'with (obj) {\n' + source + '\n}\n';
@@ -18986,6 +19208,9 @@ module.exports.InvalidTokenError = InvalidTokenError;
      * values against any array or object value, respectively. See `_.isEqual`
      * for a list of supported value comparisons.
      *
+     * **Note:** Multiple values can be checked by combining several matchers
+     * using `_.overSome`
+     *
      * @static
      * @memberOf _
      * @since 3.0.0
@@ -19001,6 +19226,10 @@ module.exports.InvalidTokenError = InvalidTokenError;
      *
      * _.filter(objects, _.matches({ 'a': 4, 'c': 6 }));
      * // => [{ 'a': 4, 'b': 5, 'c': 6 }]
+     *
+     * // Checking for several possible values
+     * _.filter(objects, _.overSome([_.matches({ 'a': 1 }), _.matches({ 'a': 4 })]));
+     * // => [{ 'a': 1, 'b': 2, 'c': 3 }, { 'a': 4, 'b': 5, 'c': 6 }]
      */
     function matches(source) {
       return baseMatches(baseClone(source, CLONE_DEEP_FLAG));
@@ -19014,6 +19243,9 @@ module.exports.InvalidTokenError = InvalidTokenError;
      * **Note:** Partial comparisons will match empty array and empty object
      * `srcValue` values against any array or object value, respectively. See
      * `_.isEqual` for a list of supported value comparisons.
+     *
+     * **Note:** Multiple values can be checked by combining several matchers
+     * using `_.overSome`
      *
      * @static
      * @memberOf _
@@ -19031,6 +19263,10 @@ module.exports.InvalidTokenError = InvalidTokenError;
      *
      * _.find(objects, _.matchesProperty('a', 4));
      * // => { 'a': 4, 'b': 5, 'c': 6 }
+     *
+     * // Checking for several possible values
+     * _.filter(objects, _.overSome([_.matchesProperty('a', 1), _.matchesProperty('a', 4)]));
+     * // => [{ 'a': 1, 'b': 2, 'c': 3 }, { 'a': 4, 'b': 5, 'c': 6 }]
      */
     function matchesProperty(path, srcValue) {
       return baseMatchesProperty(path, baseClone(srcValue, CLONE_DEEP_FLAG));
@@ -19254,6 +19490,10 @@ module.exports.InvalidTokenError = InvalidTokenError;
      * Creates a function that checks if **all** of the `predicates` return
      * truthy when invoked with the arguments it receives.
      *
+     * Following shorthands are possible for providing predicates.
+     * Pass an `Object` and it will be used as an parameter for `_.matches` to create the predicate.
+     * Pass an `Array` of parameters for `_.matchesProperty` and the predicate will be created using them.
+     *
      * @static
      * @memberOf _
      * @since 4.0.0
@@ -19280,6 +19520,10 @@ module.exports.InvalidTokenError = InvalidTokenError;
      * Creates a function that checks if **any** of the `predicates` return
      * truthy when invoked with the arguments it receives.
      *
+     * Following shorthands are possible for providing predicates.
+     * Pass an `Object` and it will be used as an parameter for `_.matches` to create the predicate.
+     * Pass an `Array` of parameters for `_.matchesProperty` and the predicate will be created using them.
+     *
      * @static
      * @memberOf _
      * @since 4.0.0
@@ -19299,6 +19543,9 @@ module.exports.InvalidTokenError = InvalidTokenError;
      *
      * func(NaN);
      * // => false
+     *
+     * var matchesFunc = _.overSome([{ 'a': 1 }, { 'a': 2 }])
+     * var matchesPropertyFunc = _.overSome([['a', 1], ['a', 2]])
      */
     var overSome = createOver(arraySome);
 
@@ -20553,7 +20800,7 @@ module.exports.InvalidTokenError = InvalidTokenError;
   }
 }.call(this));
 
-}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+}).call(this)}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
 },{}],29:[function(require,module,exports){
 // shim for using process in browser
 var process = module.exports = {};
@@ -20741,7 +20988,7 @@ process.chdir = function (dir) {
 process.umask = function() { return 0; };
 
 },{}],30:[function(require,module,exports){
-(function (process){
+(function (process){(function (){
 'use strict';
 
 Object.defineProperty(exports, '__esModule', { value: true });
@@ -21390,9 +21637,9 @@ exports.applyMiddleware = applyMiddleware;
 exports.compose = compose;
 exports.__DO_NOT_USE__ActionTypes = ActionTypes;
 
-}).call(this,require('_process'))
+}).call(this)}).call(this,require('_process'))
 },{"_process":29,"symbol-observable":31}],31:[function(require,module,exports){
-(function (global){
+(function (global){(function (){
 'use strict';
 
 Object.defineProperty(exports, "__esModule", {
@@ -21422,7 +21669,7 @@ if (typeof self !== 'undefined') {
 
 var result = (0, _ponyfill2['default'])(root);
 exports['default'] = result;
-}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+}).call(this)}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
 },{"./ponyfill.js":32}],32:[function(require,module,exports){
 'use strict';
 
@@ -24222,7 +24469,7 @@ function symbolObservablePonyfill(root) {
 }));
 
 },{"./IPv6":33,"./SecondLevelDomains":34,"./punycode":36}],36:[function(require,module,exports){
-(function (global){
+(function (global){(function (){
 /*! https://mths.be/punycode v1.4.0 by @mathias */
 ;(function(root) {
 
@@ -24757,5 +25004,5 @@ function symbolObservablePonyfill(root) {
 
 }(this));
 
-}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+}).call(this)}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
 },{}]},{},[3]);
