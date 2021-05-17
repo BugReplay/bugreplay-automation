@@ -1,6 +1,6 @@
 {
   "name": "bugreplay-automation",
-  "version": "1.0.2",
+  "version": "1.0.5",
   "description": "Facilitates the automation of the BugReplay extension for recording automated test suites",
   "main": "index.js",
   "scripts": {
