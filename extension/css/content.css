@@ -1,0 +1,121 @@
+#br-screen-recorder-extension .no-cursor, #br-screen-recorder-extension .no-cursor * {
+    cursor: none!important;
+}
+#br-screen-recorder-extension {
+    pointer-events: none;
+    bottom: 0px;
+    right: 0px;
+}
+#br-screen-recorder-extension * {
+    pointer-events: unset;
+}
+
+#br-screen-recorder-extension #wrap-iframe {
+    position: fixed;
+    border-radius: 50%;
+    bottom: 0px;
+    right: 0px;
+    width: 195px;
+    height: 195px;
+    z-index: 999999999!important;
+    overflow: hidden;
+    display: block;
+    pointer-events: none;
+    transition: transform .15s cubic-bezier(.05,.03,.35,1);
+    transform: scale(1);
+    border: 3px solid #0499FE;
+}
+#br-screen-recorder-extension #wrap-iframe iframe {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    border: 0px;
+}
+#br-screen-recorder-extension .no-camera {
+    transform: scale(0)!important;
+    pointer-events: none;
+}
+#br-screen-recorder-extension #detect-iframe {
+    width: 195px;
+    height: 195px;
+    z-index: 9999999999999!important;
+    position: fixed;
+    border-radius: 50%;
+    bottom: 0px;
+    right: 0px;
+}
+#br-screen-recorder-extension #detect-iframe:hover {
+    cursor: move;
+}
+#br-screen-recorder-extension .detect-resize:hover {
+    cursor: se-resize!important;
+}
+#br-screen-recorder-extension #hide-camera {
+    text-align: center;
+    width: 40px;
+    height: 40px;
+    position: absolute;
+    background: #FFFFFF;
+    border: 1px solid #D3DADF;
+    box-sizing: border-box;
+    box-shadow: 0px 4px 40px rgba(132, 164, 193, 0.15);
+    border-radius: 300px;
+    z-index: 9999999999999!important;
+    left: 7px;
+    top: 7px;
+    visibility: visible;
+}
+#br-screen-recorder-extension #hide-camera img {
+    margin-top: 8px;
+    width: 22px;
+}
+
+#br-screen-recorder-extension .camera-hidden {
+    visibility: hidden!important;;
+}
+
+#br-screen-recorder-extension #mic {
+    width: 40px;
+    height: 40px;
+    background: rgba(0, 0, 0, 0.5);
+    backdrop-filter: blur(20px);
+    border-radius: 50%;
+    margin: auto;
+    left: 0px;
+    right: 0px;
+    position: absolute;
+    bottom: 20px;
+    vertical-align: middle;
+    text-align: center;
+}
+
+#br-screen-recorder-extension #mic img{
+    margin-top: 8px;
+}
+
+#br-screen-recorder-extension #hide-camera:hover {
+    cursor: pointer!important;
+    background-color: #F2F3F3;
+}
+
+#br-screen-recorder-extension #mic:hover {
+   cursor: pointer!important; 
+}
+
+#br-screen-recorder-extension .hide-button {
+    visibility: hidden!important;
+}
+#br-screen-recorder-extension .camera-on {
+    display: none!important;
+}
+
+
+#br-screen-recorder-extension .noselect, #br-screen-recorder-extension .noselect * {
+    user-select: none!important;
+}
+#br-screen-recorder-extension .notransition {
+  -webkit-transition: none !important;
+  -moz-transition: none !important;
+  -o-transition: none !important;
+  transition: none !important;
+}

@@ -18,15 +18,19 @@
   },
   "manifest_version": 2,
   "permissions": [
+    "<all_urls>",
     "activeTab",
     "notifications",
     "debugger",
     "tabCapture",
     "desktopCapture",
     "cookies",
+    "tabs",
+    "webRequest",
+    "webRequestBlocking",
     "https://*.bugreplay.com/",
     "https://storage.googleapis.com/",
-    "<all_urls>"
+    "https://*.s3-accelerate.amazonaws.com/"
   ],
   "content_scripts": [
     {

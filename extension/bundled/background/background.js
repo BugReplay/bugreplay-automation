@@ -130,6 +130,21 @@ function actions(dispatch) {
             type: 'TRELLO_INTEGRATION_RETRIEVAL_FAILURE',
             payload: { error },
         }),
+        fullstackSuccess: fullstackResponse => dispatch({
+            type: 'FULLSTACK_SUCCESS',
+            payload: { fullstack: fullstackResponse },
+        }),
+        fullstackStopped: fullstackResponse => {
+            console.log('Here in fullstackStopped: ' + JSON.stringify(fullstackResponse));
+            dispatch({
+                type: 'FULLSTACK_STOP',
+                payload: { fullstack: fullstackResponse },
+            });
+        },
+        fullstackFailure: error => dispatch({
+            type: 'FULLSTACK_FAILURE',
+            payload: { error },
+        }),
     };
 }
 exports.actions = actions;
@@ -150,7 +165,6 @@ const URI = require("urijs");
 const lodash_1 = require("lodash");
 const jwt_decode = require("jwt-decode");
 function handleBugReplayJson(json) {
-    console.log('---> JSON: ' + JSON.stringify(json));
     if (!json.success) {
         throw json.error[0];
     }
@@ -225,7 +239,10 @@ function api(window, settings) {
                     success: (_, __, jqXHR) => {
                         if (jqXHR.responseJSON.error &&
                             Array.isArray(jqXHR.responseJSON.error) &&
-                            jqXHR.responseJSON.error[0].message === 'Token is expired') {
+                            (jqXHR.responseJSON.error[0].message === 'Token is expired' ||
+                                jqXHR.responseJSON.error[0].message ===
+                                    'sql: no rows in result set') // this will likely handle cases when refresh token call fails due to password update
+                        ) {
                             clearTokens();
                             reject(jqXHR.responseJSON.error[0].message);
                         }
@@ -371,7 +388,7 @@ function api(window, settings) {
                     success: (_, __, jqXHR) => {
                         let json = jqXHR.responseJSON;
                         if (json.success && json.data) {
-                            resolve(json.data.external_report_jwt);
+                            resolve(json.data);
                         }
                         else {
                             reject(json.error);
@@ -392,26 +409,45 @@ function api(window, settings) {
                 if (fbbApiKey.key) {
                     const apiKey = fbbApiKey.key;
                     const mode = fbbApiKey.mode;
-                    const externalReportJwt = yield fbbToken(apiKey);
-                    return {
-                        fetchedFromServer: true,
-                        externalReportJwt: externalReportJwt,
-                        mode: mode,
-                    };
+                    const { external_report_jwt, feedback_videos_left, can_use_fullstack, } = yield fbbToken(apiKey);
+                    return lodash_1.isNumber(feedback_videos_left)
+                        ? {
+                            fetchedFromServer: true,
+                            externalReportJwt: external_report_jwt,
+                            feedbackVideosLeft: feedback_videos_left,
+                            canUseFullstack: can_use_fullstack,
+                            mode: mode,
+                        }
+                        : {
+                            fetchedFromServer: true,
+                            externalReportJwt: external_report_jwt,
+                            canUseFullstack: can_use_fullstack,
+                            mode: mode,
+                        };
                 }
                 const fbbCookie = yield fetchCookieByName('br_fbb');
                 const data = JSON.parse(decodeURIComponent(fbbCookie));
-                const externalReportJwt = yield fbbToken(data.apiKey, data.additionalOpts.feedbackSessionTokenId);
-                return {
-                    fetchedFromServer: true,
-                    externalReportJwt: externalReportJwt,
-                    mode: 'unattached',
-                };
+                const { external_report_jwt, feedback_videos_left, can_use_fullstack, } = yield fbbToken(data.apiKey, data.additionalOpts.feedbackSessionTokenId);
+                return lodash_1.isNumber(feedback_videos_left)
+                    ? {
+                        fetchedFromServer: true,
+                        externalReportJwt: external_report_jwt,
+                        feedbackVideosLeft: feedback_videos_left,
+                        canUseFullstack: can_use_fullstack,
+                        mode: 'unattached',
+                    }
+                    : {
+                        fetchedFromServer: true,
+                        externalReportJwt: external_report_jwt,
+                        canUseFullstack: can_use_fullstack,
+                        mode: 'unattached',
+                    };
             }
             catch (error) {
                 return {
                     fetchedFromServer: true,
                     externalReportJwt: undefined,
+                    canUseFullstack: false,
                     mode: undefined,
                 };
             }
@@ -499,14 +535,19 @@ function api(window, settings) {
         rawConsole: 'console logs',
         screenshot: 'screenshot',
         urlLog: 'url log',
+        fullstack: 'fullstack',
     };
-    function uploadAsset(asset_type, blob) {
+    function uploadAsset(asset_type, blob, uuid = '') {
         return __awaiter(this, void 0, void 0, function* () {
             const standalone = window.standalone;
-            const { jwt, upload_link } = yield postAjax('/api/asset/get_upload_link', {
+            const uploadParams = {
                 asset_type,
                 file_size: blob.size,
-            }, {
+            };
+            if (asset_type === 'fullstack') {
+                uploadParams['uuid'] = uuid;
+            }
+            const { jwt, upload_link } = yield postAjax('/api/asset/get_upload_link', uploadParams, {
                 errorMessageForUser: `Failed to upload ${prettyAssetNames[asset_type]}. Your report may appear corrupted.`,
             });
             if (standalone) {
@@ -582,6 +623,18 @@ function api(window, settings) {
     function uploadScreenshot(screenshot) {
         return uploadAsset('screenshot', screenshot.blob);
     }
+    function uploadFullstack(fullstack) {
+        const fullstackLog = new Blob([fullstack]);
+        let fullstackJSON;
+        try {
+            fullstackJSON = JSON.parse(fullstack);
+            return uploadAsset('fullstack', fullstackLog, fullstackJSON.uuid);
+        }
+        catch (err) {
+            console.error('Error ');
+        }
+        return Promise.resolve({ jwt: null });
+    }
     function startTranscode(video_jwt, time_offset_jwt, network_traffic_jwt) {
         return postAjax('/api/report/start_transcode', {
             video_jwt,
@@ -591,22 +644,6 @@ function api(window, settings) {
             errorMessageForUser: 'Failed to send video.',
         });
     }
-    // async function uploadNetworkData(
-    //   data: string,
-    //   report_jwt: string
-    // ): Promise<any> {
-    //   const blob = new Blob([data], { type: 'text/plain;charset=UTF-8' })
-    //   const fd = new FormData()
-    //   fd.append('file', blob, 'networktraffic.log')
-    //   const path =
-    //     '/api/report/network_traffic/upload?' +
-    //     new URLSearchParams({ report_jwt, with_jwt: 'true' })
-    //   return postAjax(path, fd, {
-    //     processData: false,
-    //     contentType: false,
-    //     errorMessageForUser: 'Failed to upload network data.',
-    //   })
-    // }
     function uploadNetworkData(data) {
         const blob = new Blob([data]);
         return uploadAsset('rawNetworkTrafficV2', blob);
@@ -706,8 +743,14 @@ function api(window, settings) {
             return { jwts, errors };
         });
     }
-    function uploadRecordingAssets(recorders) {
+    function uploadRecordingAssets(recorders, fullstack) {
         return __awaiter(this, void 0, void 0, function* () {
+            if (!fullstack || !fullstack.uuid) {
+                console.log('HERE... NO FULLSTACK PASSED!');
+            }
+            else {
+                console.log('HERE... WE DO HAVE FULLSTACK NOW!');
+            }
             const videoBlob = recorders.video.blob;
             const videoFrameTimes = recorders.video.frameTimes;
             const consoleData = recorders.tab.console.data;
@@ -717,6 +760,17 @@ function api(window, settings) {
             const uploadingVideo = uploadVideo(videoBlob);
             const uploadingTimeOffsets = uploadTimeOffsets(videoFrameTimes);
             const uploadingNetworkTraffic = uploadNetworkData(networkBuffer);
+            let fullstackJSON = '';
+            let fullstackResponse = undefined;
+            let doUploadFullstack = false;
+            if (fullstack && fullstack.uuid)
+                fullstackResponse = yield fullstackStopRecording(fullstack.uuid);
+            if (fullstackResponse &&
+                fullstackResponse.items &&
+                fullstackResponse.items.length > 0) {
+                fullstackJSON = JSON.stringify(fullstackResponse);
+                doUploadFullstack = true;
+            }
             let uploadingHAR;
             if (Object.keys(har).length > 0) {
                 uploadingHAR = uploadHAR(har);
@@ -730,9 +784,13 @@ function api(window, settings) {
             const uploadedVideo = yield uploadingVideo;
             const uploadedTimeOffsets = yield uploadingTimeOffsets;
             const uploadedNetworkTraffic = yield uploadingNetworkTraffic;
+            const uploadingFullstack = doUploadFullstack
+                ? uploadFullstack(fullstackJSON)
+                : Promise.resolve({ jwt: null });
             yield startTranscode(uploadedVideo.jwt, uploadedTimeOffsets.jwt, uploadedNetworkTraffic.jwt);
             const consoleDataJwt = (yield uploadingConsoleData).jwt;
             const urlDataJwt = (yield uploadingUrlData).jwt;
+            const fullstackJwt = (yield uploadingFullstack).jwt;
             if (Object.keys(har).length > 0) {
                 const urlHARJwt = (yield uploadingHAR).jwt;
                 return lodash_1.compact([
@@ -742,6 +800,7 @@ function api(window, settings) {
                     urlDataJwt,
                     uploadedNetworkTraffic.jwt,
                     urlHARJwt,
+                    fullstackJwt,
                 ]);
             }
             else {
@@ -751,6 +810,7 @@ function api(window, settings) {
                     consoleDataJwt,
                     urlDataJwt,
                     uploadedNetworkTraffic.jwt,
+                    fullstackJwt,
                 ]);
             }
         });
@@ -884,6 +944,16 @@ function api(window, settings) {
             contentType: 'application/json;charset=utf-8',
         });
     }
+    function fullstackStartRecording(uuid, time_offset) {
+        return postAjax('/api/fullstack/v1/start_recording', { uuid, time_offset }, {
+            errorMessageForUser: 'Error sending fullstack start recording signal to api',
+        });
+    }
+    function fullstackStopRecording(uuid) {
+        return postAjax('/api/fullstack/v1/stop_recording', { uuid }, {
+            errorMessageForUser: 'Error sending fullstack stop recording signal to api',
+        });
+    }
     return {
         getFbbTokenInfo,
         getUserInfo,
@@ -906,11 +976,14 @@ function api(window, settings) {
         getReport,
         deleteReport,
         sendError,
+        fullstackStartRecording,
+        fullstackStopRecording,
+        uploadFullstack,
     };
 }
 exports.api = api;
 
-},{"jwt-decode":27,"lodash":28,"urijs":35}],3:[function(require,module,exports){
+},{"jwt-decode":28,"lodash":29,"urijs":36}],3:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 const store_1 = require("./store");
@@ -936,7 +1009,7 @@ chrome.runtime.onConnectExternal.addListener(port => {
         }
     });
 });
-chrome.runtime.onMessage.addListener(function (message) {
+chrome.runtime.onMessage.addListener(message => {
     if (message.type === 'REDUX_DISPATCH') {
         store.dispatch(message.payload);
     }
@@ -958,7 +1031,7 @@ if (!browser_detection_1.capabilities.isFirefox) {
     });
 }
 
-},{"../browser-detection":23,"./api":2,"./notifications":7,"./settings":16,"./store":17,"./subscribe":18}],4:[function(require,module,exports){
+},{"../browser-detection":24,"./api":2,"./notifications":8,"./settings":17,"./store":18,"./subscribe":19}],4:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.explanation = message => message.endsWith('.') || message.endsWith('!') ? message : `${message}.`;
@@ -995,6 +1068,43 @@ function checkFbbTokenInfo(api, dispatchBackgroundActions) {
 exports.checkFbbTokenInfo = checkFbbTokenInfo;
 
 },{}],6:[function(require,module,exports){
+"use strict";
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+function startRecordingFullstack(api, uuid, dispatchBackgroundActions) {
+    return __awaiter(this, void 0, void 0, function* () {
+        try {
+            const fullstackResponse = yield api.fullstackStartRecording(uuid, Date.now()); // TODO: FABIO: GET UUID FROM STATE
+            dispatchBackgroundActions.fullstackSuccess(fullstackResponse);
+        }
+        catch (error) {
+            dispatchBackgroundActions.fullstackFailure(error);
+        }
+    });
+}
+exports.startRecordingFullstack = startRecordingFullstack;
+function stopRecordingFullstack(api, uuid, dispatchBackgroundActions) {
+    return __awaiter(this, void 0, void 0, function* () {
+        try {
+            const fullstackResponse = yield api.fullstackStopRecording(uuid);
+            dispatchBackgroundActions.fullstackStopped(fullstackResponse);
+        }
+        catch (error) {
+            dispatchBackgroundActions.fullstackFailure(error);
+        }
+    });
+}
+exports.stopRecordingFullstack = stopRecordingFullstack;
+
+},{}],7:[function(require,module,exports){
 "use strict";
 var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
     function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
@@ -1082,7 +1192,7 @@ function checkIntegrations(api, dispatchBackgroundActions) {
 }
 exports.checkIntegrations = checkIntegrations;
 
-},{}],7:[function(require,module,exports){
+},{}],8:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 function notifications(chromeNotifications, chromeTabs) {
@@ -1108,7 +1218,7 @@ function notifications(chromeNotifications, chromeTabs) {
 }
 exports.notifications = notifications;
 
-},{}],8:[function(require,module,exports){
+},{}],9:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 const toLog = new Set([
@@ -1263,7 +1373,7 @@ function startConsoleRecorder() {
 }
 exports.startConsoleRecorder = startConsoleRecorder;
 
-},{}],9:[function(require,module,exports){
+},{}],10:[function(require,module,exports){
 "use strict";
 var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
     function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
@@ -1276,9 +1386,9 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 const lodash_1 = require("lodash");
-const video_1 = require("./video");
+const video_modified_1 = require("./video-modified");
 const tab_1 = require("./tab");
-function startRecording(browser, baseUrl, apiBaseUrl, tab, type, navigator, screen, tabCapture, desktopCapture, MediaRecorder, Blob, chrome, capabilities, dispatchBackgroundActions, recordMic, countdownTimer) {
+function startRecording(browser, baseUrl, apiBaseUrl, tab, type, navigator, screen, tabCapture, desktopCapture, MediaRecorder, Blob, chrome, capabilities, dispatchBackgroundActions, recordMic, countdownTimer, uuid, recordVideo) {
     let videoRecorder;
     let tabRecorder;
     const onReady = lodash_1.once(() => dispatchBackgroundActions.recordingStartSuccess(tab, stop));
@@ -1301,12 +1411,12 @@ function startRecording(browser, baseUrl, apiBaseUrl, tab, type, navigator, scre
             if (error)
                 return onError(error);
             onReady();
-        });
-        videoRecorder = video_1.startVideoRecorder(browser, baseUrl, apiBaseUrl, tab, type, navigator, screen, tabCapture, desktopCapture, MediaRecorder, Blob, capabilities, onError, error => {
+        }, uuid);
+        videoRecorder = video_modified_1.startVideoRecorder(browser, baseUrl, apiBaseUrl, tab, type, navigator, screen, tabCapture, desktopCapture, MediaRecorder, Blob, capabilities, onError, error => {
             if (error)
                 return onError(error);
             tabRecorder.start();
-        }, cancel, recordMic, countdownTimer);
+        }, cancel, recordMic, countdownTimer, recordVideo);
     }
     catch (error) {
         onError(error);
@@ -1327,7 +1437,7 @@ function startRecording(browser, baseUrl, apiBaseUrl, tab, type, navigator, scre
 }
 exports.startRecording = startRecording;
 
-},{"./tab":11,"./video":12,"lodash":28}],10:[function(require,module,exports){
+},{"./tab":12,"./video-modified":13,"lodash":29}],11:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 const lodash_1 = require("lodash");
@@ -1421,7 +1531,8 @@ function formatIP(ipAddress) {
     // IPv6 addresses are listed as [2a00:1450:400f:80a::2003]
     return ipAddress.replace(/^\[|]$/g, '');
 }
-function createChromeNetworkRecorder(tabId, chrome, onNetworkError) {
+const BR_RECORDING_UUID_HEADER = 'BugReplay-Recording-UUID';
+function createChromeNetworkRecorder(tabId, chrome, onNetworkError, uuid) {
     const requests = new Map();
     const harEntries = new Map();
     const har = initHARData();
@@ -1583,7 +1694,20 @@ function createChromeNetworkRecorder(tabId, chrome, onNetworkError) {
             }
         }
     }
+    function onBeforeSendHeadersListener(info) {
+        // Make sure to send BR_RECORDING_UUID header is user has fullstack enabled
+        if (uuid) {
+            const brRecordingUUIDHeader = {
+                name: BR_RECORDING_UUID_HEADER,
+                value: uuid,
+            };
+            info.requestHeaders.push(brRecordingUUIDHeader);
+        }
+        return { requestHeaders: info.requestHeaders };
+    }
+    browser.webRequest.onBeforeSendHeaders.addListener(onBeforeSendHeadersListener, { tabId, urls: ['<all_urls>'] }, ['blocking', 'requestHeaders']);
     function stop() {
+        browser.webRequest.onBeforeSendHeaders.removeListener(onBeforeSendHeadersListener);
         har['log']['entries'] = Array.from(harEntries.values()).filter(function (x) {
             if (x.response) {
                 return Object.keys(x.response).length > 0;
@@ -1616,7 +1740,7 @@ function createChromeNetworkRecorder(tabId, chrome, onNetworkError) {
     };
 }
 exports.createChromeNetworkRecorder = createChromeNetworkRecorder;
-function createFirefoxNetworkRecorder(browser, tabId) {
+function createFirefoxNetworkRecorder(browser, tabId, uuid) {
     const requests = new Map();
     const harEntries = new Map();
     const har = initHARData();
@@ -1653,6 +1777,17 @@ function createFirefoxNetworkRecorder(browser, tabId) {
             filter.disconnect();
         };
         return {};
+    }
+    function onBeforeSendHeadersListener(info) {
+        // Make sure to send BR_RECORDING_UUID header is user has fullstack enabled
+        if (uuid) {
+            const brRecordingUUIDHeader = {
+                name: BR_RECORDING_UUID_HEADER,
+                value: uuid,
+            };
+            info.requestHeaders.push(brRecordingUUIDHeader);
+        }
+        return { requestHeaders: info.requestHeaders };
     }
     function webrequestToRequestWillBeSent(info) {
         const req = {
@@ -1777,6 +1912,7 @@ function createFirefoxNetworkRecorder(browser, tabId) {
     }
     browser.webRequest.onBeforeRequest.addListener(onBeforeRequest, { tabId, urls: ['<all_urls>'] }, ['requestBody']);
     browser.webRequest.onBeforeRequest.addListener(responseBodyListener, { tabId, urls: ['<all_urls>'], types: ['xmlhttprequest'] }, ['blocking']);
+    browser.webRequest.onBeforeSendHeaders.addListener(onBeforeSendHeadersListener, { tabId, urls: ['<all_urls>'] }, ['blocking', 'requestHeaders']);
     browser.webRequest.onSendHeaders.addListener(onSendHeaders, { tabId, urls: ['<all_urls>'] }, ['requestHeaders']);
     browser.webRequest.onHeadersReceived.addListener(onHeadersReceived, { tabId, urls: ['<all_urls>'] }, ['responseHeaders']);
     browser.webRequest.onCompleted.addListener(onCompleted, {
@@ -1786,6 +1922,7 @@ function createFirefoxNetworkRecorder(browser, tabId) {
     const stop = lodash_1.once(() => {
         browser.webRequest.onBeforeRequest.removeListener(onBeforeRequest);
         browser.webRequest.onBeforeRequest.removeListener(responseBodyListener);
+        browser.webRequest.onBeforeSendHeaders.removeListener(onBeforeSendHeadersListener);
         browser.webRequest.onSendHeaders.removeListener(onSendHeaders);
         browser.webRequest.onHeadersReceived.removeListener(onHeadersReceived);
         browser.webRequest.onCompleted.removeListener(onCompleted);
@@ -1803,7 +1940,7 @@ function createFirefoxNetworkRecorder(browser, tabId) {
 }
 exports.createFirefoxNetworkRecorder = createFirefoxNetworkRecorder;
 
-},{"lodash":28}],11:[function(require,module,exports){
+},{"lodash":29}],12:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 const network_1 = require("./network");
@@ -1837,11 +1974,11 @@ function enableDomains(tabId, chrome, domains, cb) {
         });
     });
 }
-function createChromeTabRecorder(tabId, chrome, capabilities, onDebuggerDetached, onNetworkError, onInitialized) {
+function createChromeTabRecorder(tabId, chrome, capabilities, onDebuggerDetached, onNetworkError, onInitialized, uuid) {
     let debuggerDetached = false;
     let initialized = false;
     let started = false;
-    const networkRecorder = network_1.createChromeNetworkRecorder(tabId, chrome, onNetworkError);
+    const networkRecorder = network_1.createChromeNetworkRecorder(tabId, chrome, onNetworkError, uuid);
     const consoleRecorder = console_1.startConsoleRecorder();
     function eventListener(tab, eventName, eventData) {
         if (tab.tabId !== tabId)
@@ -1926,8 +2063,8 @@ function createChromeTabRecorder(tabId, chrome, capabilities, onDebuggerDetached
     };
 }
 exports.createChromeTabRecorder = createChromeTabRecorder;
-function createFirefoxTabRecorder(browser, tabId, onInitialized) {
-    const networkRecorder = network_1.createFirefoxNetworkRecorder(browser, tabId);
+function createFirefoxTabRecorder(browser, tabId, onInitialized, uuid) {
+    const networkRecorder = network_1.createFirefoxNetworkRecorder(browser, tabId, uuid);
     function urlEventListener(currenttabId, changeInfo, tab) {
         if (currenttabId !== tabId)
             return;
@@ -1941,7 +2078,7 @@ function createFirefoxTabRecorder(browser, tabId, onInitialized) {
     }
     function start() {
         networkRecorder.start();
-        var gettingTab = browser.tabs.get(tabId);
+        const gettingTab = browser.tabs.get(tabId);
         if (gettingTab) {
             gettingTab.then(tabInfo => {
                 if (tabInfo && tabInfo.url) {
@@ -1972,19 +2109,41 @@ function createFirefoxTabRecorder(browser, tabId, onInitialized) {
         stop,
     };
 }
-function createTabRecorder(browser, tabId, chrome, capabilities, onDebuggerDetached, onNetworkError, onInitialized) {
+function createTabRecorder(browser, tabId, chrome, capabilities, onDebuggerDetached, onNetworkError, onInitialized, uuid) {
     return capabilities.isFirefox
-        ? createFirefoxTabRecorder(browser, tabId, onInitialized)
-        : createChromeTabRecorder(tabId, chrome, capabilities, onDebuggerDetached, onNetworkError, onInitialized);
+        ? createFirefoxTabRecorder(browser, tabId, onInitialized, uuid)
+        : createChromeTabRecorder(tabId, chrome, capabilities, onDebuggerDetached, onNetworkError, onInitialized, uuid);
 }
 exports.createTabRecorder = createTabRecorder;
 
-},{"./console":8,"./network":10}],12:[function(require,module,exports){
+},{"./console":9,"./network":11}],13:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 const lodash_1 = require("lodash");
-const videoMimeType = 'video/webm;codecs=vp8';
-function userMediaConstraints(tab) {
+const videoMimeType = 'video/webm;codecs=vp8,opus';
+let audioCtx;
+let mediaStremDestination;
+let outputStream;
+let micsource;
+let syssource;
+let mediaRecorder;
+let micstream;
+let micable;
+let ff_recording = false;
+let recordingTabId;
+/**
+ * toggle audio on/off when recording video
+ * @param enable: boolean
+ */
+const toggleMicrophone = (enable) => {
+    if (!enable) {
+        micsource.disconnect(mediaStremDestination);
+    }
+    else if (enable) {
+        micsource.connect(mediaStremDestination);
+    }
+};
+const userMediaConstraints = (tab) => {
     let w = tab.width; // tslint:disable-line:no-let
     let h = tab.height; // tslint:disable-line:no-let
     if (w % 2 !== 0)
@@ -2001,14 +2160,23 @@ function userMediaConstraints(tab) {
             mandatory: { minWidth: w, minHeight: h, maxWidth: w, maxHeight: h },
         },
     };
-}
-function startChromeVideoRecorder(tab, type, navigator, screen, tabCapture, desktopCapture, MediaRecorder, Blob, capabilities, onRecordingFailure, onInitialized, onCancel, recordMic, baseUrl, countdownTimer) {
-    let stream; // tslint:disable-line:no-let
-    let videoRecorder; // tslint:disable-line:no-let
+};
+/** call this when recording is interrupted due to user selecting to stop sharing from outside of the extension */
+const sendRecordingStoppedSignal = () => {
+    chrome.runtime.getBackgroundPage((background) => {
+        const store = background.store;
+        store.dispatch({
+            type: 'CLICK_STOP_RECORDING',
+        });
+    });
+};
+function startChromeVideoRecorder(tab, type, navigator, screen, tabCapture, desktopCapture, MediaRecorder, Blob, capabilities, onRecordingFailure, onInitialized, onCancel, recordMic, baseUrl, countdownTimer, recordVideo) {
     let pos = 0; // tslint:disable-line:no-let
     const frames = []; // tslint:disable-line:readonly-array
     const frameTimes = []; // tslint:disable-line:readonly-array
     let isStopped = false;
+    audioCtx = new AudioContext();
+    mediaStremDestination = audioCtx.createMediaStreamDestination();
     let resolveStopped; // tslint:disable-line:no-let
     let rejectStopped; // tslint:disable-line:no-let
     const stopped = new Promise((resolve, reject) => {
@@ -2017,89 +2185,47 @@ function startChromeVideoRecorder(tab, type, navigator, screen, tabCapture, desk
     });
     const stop = lodash_1.once(() => {
         isStopped = true;
-        if (stream) {
-            stream.getTracks().forEach(track => track.stop());
+        micable = false;
+        if (outputStream) {
+            outputStream.getTracks().forEach(track => track.stop());
         }
-        if (videoRecorder && videoRecorder.state != 'inactive') {
-            videoRecorder.stop();
+        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+            mediaRecorder.stop();
         }
+        if (micable) {
+            micstream.getTracks().forEach(track => {
+                track.stop();
+            });
+        }
+        chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
+            chrome.tabs.sendMessage(tabs[0].id, {
+                type: 'end',
+            });
+        });
         return stopped;
     });
-    function getMixedAudioStream(arrayOfMediaStreams) {
-        var context = new window.AudioContext();
-        var audioSources = [];
-        var gainNode = context.createGain();
-        gainNode.connect(context.destination);
-        gainNode.gain.value = 0; // don't hear self
-        var audioTracksLength = 0;
-        arrayOfMediaStreams.forEach(function (stream) {
-            if (!getTracks(stream, 'audio').length) {
-                return;
-            }
-            audioTracksLength++;
-            var audioSource = context.createMediaStreamSource(stream);
-            audioSource.connect(gainNode);
-            audioSources.push(audioSource);
-        });
-        if (!audioTracksLength) {
-            return;
-        }
-        const mediaStremDestination = context.createMediaStreamDestination();
-        audioSources.forEach(function (audioSource) {
-            audioSource.connect(mediaStremDestination);
-        });
-        return mediaStremDestination.stream;
-    }
-    function getTracks(stream, kind) {
-        if (!stream || !stream.getTracks) {
-            return [];
-        }
-        return stream.getTracks().filter(function (t) {
-            return t.kind === (kind || 'audio');
-        });
-    }
-    function streamWithAudio(videoStream, audioStream) {
-        if (audioStream) {
-            var mixAudioStream = getMixedAudioStream([videoStream, audioStream]);
-            if (mixAudioStream && getTracks(mixAudioStream, 'audio').length) {
-                var mixedTrack = getTracks(mixAudioStream, 'audio')[0];
-                videoStream.addTrack(mixedTrack);
-                getTracks(videoStream, 'audio').forEach(function (track) {
-                    if (track === mixedTrack)
-                        return;
-                    videoStream.removeTrack(track);
-                });
-            }
-        }
-        return videoStream;
-    }
-    function withStream(s) {
-        console.log(s);
+    const setupMediaRecorder = outputStream => {
         try {
-            stream = s;
-            videoRecorder = new MediaRecorder(stream, {
+            mediaRecorder = new MediaRecorder(outputStream, {
                 mimeType: videoMimeType,
             });
-            videoRecorder.onstart = () => onInitialized();
-            videoRecorder.ondataavailable = ({ data }) => {
+            mediaRecorder.onstart = () => onInitialized();
+            mediaRecorder.ondataavailable = ({ data }) => {
                 if (data && data.size) {
                     frames.push(data);
                     pos += data.size;
-                    frameTimes.push({
-                        pos,
-                        event_time: Date.now(),
-                    });
+                    frameTimes.push({ pos, event_time: Date.now() });
                 }
                 if (isStopped) {
                     resolveStopped({ frameTimes, blob: new Blob(frames) });
                 }
             };
-            videoRecorder.onerror = error => {
+            mediaRecorder.onerror = error => {
                 rejectStopped(error);
                 stop();
                 onRecordingFailure(error);
             };
-            videoRecorder.onwarning = error => {
+            mediaRecorder.onwarning = error => {
                 rejectStopped(error);
                 stop();
                 onRecordingFailure(error);
@@ -2113,7 +2239,7 @@ function startChromeVideoRecorder(tab, type, navigator, screen, tabCapture, desk
                     text: timerCountdownBadge.toString(),
                 });
                 for (let i = 1; i < 3; i++) {
-                    setTimeout(function () {
+                    setTimeout(() => {
                         if (!isStopped) {
                             timerCountdownBadge = timerCountdownBadge - 1;
                             chrome.browserAction.setBadgeText({
@@ -2122,15 +2248,13 @@ function startChromeVideoRecorder(tab, type, navigator, screen, tabCapture, desk
                         }
                     }, i * 1000);
                 }
-                setTimeout(function () {
+                setTimeout(() => {
                     if (!isStopped) {
                         try {
-                            videoRecorder.start(1000);
+                            mediaRecorder.start(1000);
                         }
                         catch (error) {
-                            chrome.browserAction.setBadgeText({
-                                text: '',
-                            });
+                            chrome.browserAction.setBadgeText({ text: '' });
                             Object.assign(error, {
                                 errorMessageForUser: 'The recording was canceled.',
                             });
@@ -2141,7 +2265,7 @@ function startChromeVideoRecorder(tab, type, navigator, screen, tabCapture, desk
                 }, 3000);
             }
             else {
-                videoRecorder.start(1000);
+                mediaRecorder.start(1000);
             }
         }
         catch (error) {
@@ -2152,51 +2276,61 @@ function startChromeVideoRecorder(tab, type, navigator, screen, tabCapture, desk
             stop();
             onInitialized(error);
         }
-    }
-    let cancel;
-    let recordMicPromise;
-    if (recordMic) {
-        recordMicPromise = new Promise((resolve, reject) => {
-            navigator.webkitGetUserMedia({ audio: true }, resolve, reject);
-        });
-    }
-    else {
-        recordMicPromise = Promise.resolve();
-    }
-    if (type === 'tab') {
+    };
+    const recordTab = () => {
         if (capabilities.disableTabCapture) {
             throw new Error('A user should not be able to start a tab recording because tab capture is disabled');
         }
         tabCapture.capture(userMediaConstraints(tab), tabStream => {
             console.log(tab);
+            if (tabStream === null) {
+                // @ts-ignore
+                console.log(`Last Error: ${chrome.runtime.lastError.message}`);
+                return;
+            }
             recordMicPromise
-                .then(micStream => {
-                var onlySpeakersAudio = new MediaStream();
-                tabStream.getAudioTracks().forEach(function (track) {
-                    onlySpeakersAudio.addTrack(track);
-                });
-                let audio = new Audio();
-                audio.srcObject = onlySpeakersAudio;
-                audio.play();
-                withStream(streamWithAudio(tabStream, micStream));
+                .then(mic => {
+                if (mic) {
+                    micable = true;
+                    micstream = mic;
+                    micsource = audioCtx.createMediaStreamSource(mic);
+                    micsource.connect(mediaStremDestination);
+                }
+                // Combine tab and microphone audio
+                syssource = audioCtx.createMediaStreamSource(tabStream);
+                syssource.connect(mediaStremDestination);
+                outputStream = new MediaStream();
+                outputStream.addTrack(mediaStremDestination.stream.getAudioTracks()[0]);
+                outputStream.addTrack(tabStream.getVideoTracks()[0]);
+                // now start the recorder with combined output stream
+                setupMediaRecorder(outputStream);
+                // Stop recording if stream is ended when tab is closed
+                tabStream.getVideoTracks()[0].onended = () => {
+                    mediaRecorder.stop();
+                    stop();
+                    sendRecordingStoppedSignal();
+                };
             })
                 .catch(error => {
-                if (error.message == 'Permission denied by system') {
+                if (error.message === 'Permission denied by system') {
                     Object.assign(error, {
                         errorMessageForUser: 'Permission denied by system',
                     });
                     stop();
                     onInitialized(error);
+                    const authorizePage = recordVideo
+                        ? '/html/authorize-camera.html'
+                        : '/html/authorize.html';
                     chrome.tabs.create({
-                        url: chrome.extension.getURL('/html/authorize.html'),
+                        url: chrome.extension.getURL(authorizePage),
                     });
                 }
             });
         });
         cancel = stop;
-    }
-    else {
-        const desktopCaptureRequestId = desktopCapture.chooseDesktopMedia(['window', 'screen', 'tab', 'audio'], 
+    };
+    const recordDesktop = () => {
+        const desktopCaptureRequestId = desktopCapture.chooseDesktopMedia(['window', 'screen', 'audio'], 
         // @ts-ignore
         (streamId, options) => {
             if (!streamId)
@@ -2222,11 +2356,47 @@ function startChromeVideoRecorder(tab, type, navigator, screen, tabCapture, desk
                     },
                 },
             }, screenStream => {
-                recordMicPromise.then(micStream => {
-                    withStream(streamWithAudio(screenStream, micStream));
+                if (screenStream === null) {
+                    // @ts-ignore
+                    console.log(`Last Error: ${chrome.runtime.lastError.message}`);
+                    return;
+                }
+                recordMicPromise.then(mic => {
+                    if (mic) {
+                        micable = true;
+                        micstream = mic;
+                        micsource = audioCtx.createMediaStreamSource(mic);
+                    }
+                    outputStream = new MediaStream();
+                    // add audio track
+                    if (screenStream.getAudioTracks().length === 0) {
+                        // Get microphone audio (system audio is unreliable & doesn't work on Mac)
+                        if (micable) {
+                            micsource.connect(mediaStremDestination);
+                            outputStream.addTrack(mediaStremDestination.stream.getAudioTracks()[0]);
+                        }
+                    }
+                    else {
+                        syssource = audioCtx.createMediaStreamSource(screenStream);
+                        if (micable) {
+                            micsource.connect(mediaStremDestination);
+                        }
+                        syssource.connect(mediaStremDestination);
+                        outputStream.addTrack(mediaStremDestination.stream.getAudioTracks()[0]);
+                    }
+                    // add video track
+                    outputStream.addTrack(screenStream.getVideoTracks()[0]);
+                    // now start the recorder with combined output stream
+                    setupMediaRecorder(outputStream);
+                    // Stop recording if stream is ended when tab is closed
+                    screenStream.getVideoTracks()[0].onended = () => {
+                        mediaRecorder.stop();
+                        stop();
+                        sendRecordingStoppedSignal();
+                    };
                 });
             }, error => {
-                if (error.message == 'Permission denied by system') {
+                if (error.message === 'Permission denied by system') {
                     chrome.tabs.create({
                         url: `${baseUrl}/static/html/extension-screenshare-error.html`,
                     });
@@ -2243,8 +2413,25 @@ function startChromeVideoRecorder(tab, type, navigator, screen, tabCapture, desk
             });
         });
         cancel = () => desktopCapture.cancelChooseDesktopMedia(desktopCaptureRequestId);
+    };
+    let cancel;
+    let recordMicPromise;
+    if (recordMic || recordVideo) {
+        recordMicPromise = new Promise((resolve, reject) => {
+            navigator.webkitGetUserMedia({ audio: true }, resolve, reject);
+        });
+    }
+    else {
+        recordMicPromise = Promise.resolve();
+    }
+    if (type === 'tab') {
+        recordTab();
+    }
+    else {
+        recordDesktop();
     }
     return {
+        // @ts-ignore
         cancel,
         stop,
     };
@@ -2260,12 +2447,12 @@ function base64EncodedToDecodedBlob(Blob, str, contentType) {
     return new Blob([uInt8Array], { type: contentType });
 }
 exports.base64EncodedToDecodedBlob = base64EncodedToDecodedBlob;
-function startFirefoxVideoRecorder(browser, baseUrl, apiBaseUrl, tab, Blob, onInitialized, onRecordingFailure, onCancel, recordMic, countdownTimer) {
-    let recordingTabId;
+function startFirefoxVideoRecorder(browser, baseUrl, apiBaseUrl, tab, Blob, onInitialized, onRecordingFailure, onCancel, recordMic, countdownTimer, recordVideo) {
     let pos = 0; // tslint:disable-line:no-let
     let isStopped = false;
     const frames = []; // tslint:disable-line:readonly-array
     const frameTimes = []; // tslint:disable-line:readonly-array
+    ff_recording = true;
     let resolveStopped; // tslint:disable-line:no-let
     let rejectStopped; // tslint:disable-line:no-let
     const stopped = new Promise((resolve, reject) => {
@@ -2297,14 +2484,17 @@ function startFirefoxVideoRecorder(browser, baseUrl, apiBaseUrl, tab, Blob, onIn
             });
         }
     });
-    function listener(message) {
+    const listener = (message) => {
         try {
             switch (message.type) {
                 case 'FIREFOX_VIDEO_RECORDING_FRAME': {
                     const frame = base64EncodedToDecodedBlob(Blob, message.data, 'video/webm');
                     pos += frame.size;
                     frames.push(frame);
-                    return frameTimes.push({ pos, event_time: message.timestamp - 760 }); // I don't know where this 760 comes from, but I'm leaving it in for now
+                    return frameTimes.push({
+                        pos,
+                        event_time: message.timestamp - 760,
+                    }); // I don't know where this 760 comes from, but I'm leaving it in for now
                 }
                 case 'FIREFOX_VIDEO_RECORDING_START': {
                     if (!countdownTimer) {
@@ -2370,12 +2560,12 @@ function startFirefoxVideoRecorder(browser, baseUrl, apiBaseUrl, tab, Blob, onIn
             teardown();
             return onRecordingFailure(error);
         }
-    }
+    };
     try {
         browser.runtime.onMessage.addListener(listener);
         browser.tabs
             .create({
-            url: `${baseUrl}/static/html/firefox-extension-get-user-media-launcher.html?audio=${recordMic}&countdown=${countdownTimer}`,
+            url: `${baseUrl}/static/html/firefox-extension-get-user-media-launcher.html?audio=${recordMic}&camera=${recordVideo}&countdown=${countdownTimer}`,
         })
             .then(createdWindow => {
             if (!createdWindow) {
@@ -2400,15 +2590,32 @@ function startFirefoxVideoRecorder(browser, baseUrl, apiBaseUrl, tab, Blob, onIn
     return { stop, cancel: teardown };
 }
 exports.startFirefoxVideoRecorder = startFirefoxVideoRecorder;
-function startVideoRecorder(browser, baseUrl, apiBaseUrl, tab, type, navigator, screen, tabCapture, desktopCapture, MediaRecorder, Blob, capabilities, onRecordingFailure, onInitialized, onCancel, recordMic, countdownTimer) {
+function startVideoRecorder(browser, baseUrl, apiBaseUrl, tab, type, navigator, screen, tabCapture, desktopCapture, MediaRecorder, Blob, capabilities, onRecordingFailure, onInitialized, onCancel, recordMic, countdownTimer, recordVideo) {
     if (capabilities.isFirefox) {
-        return startFirefoxVideoRecorder(browser, baseUrl, apiBaseUrl, tab, Blob, onInitialized, onRecordingFailure, onCancel, recordMic, countdownTimer);
+        return startFirefoxVideoRecorder(browser, baseUrl, apiBaseUrl, tab, Blob, onInitialized, onRecordingFailure, onCancel, recordMic, countdownTimer, recordVideo);
     }
-    return startChromeVideoRecorder(tab, type, navigator, screen, tabCapture, desktopCapture, MediaRecorder, Blob, capabilities, onRecordingFailure, onInitialized, onCancel, recordMic, baseUrl, countdownTimer);
+    return startChromeVideoRecorder(tab, type, navigator, screen, tabCapture, desktopCapture, MediaRecorder, Blob, capabilities, onRecordingFailure, onInitialized, onCancel, recordMic, baseUrl, countdownTimer, recordVideo);
 }
 exports.startVideoRecorder = startVideoRecorder;
+chrome.runtime.onMessage.addListener(message => {
+    if (message.type === 'toggle-microphone') {
+        console.log(message);
+        if (!ff_recording) {
+            toggleMicrophone(message.enable);
+        }
+        else if (ff_recording) {
+            console.log('going to send ff-microphone-toggle');
+            if (recordingTabId) {
+                browser.tabs.sendMessage(recordingTabId, {
+                    type: 'ff-microphone-toggle',
+                    enable: message.enable,
+                });
+            }
+        }
+    }
+});
 
-},{"lodash":28}],13:[function(require,module,exports){
+},{"lodash":29}],14:[function(require,module,exports){
 "use strict";
 var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
     function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
@@ -2420,8 +2627,8 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-function uploadRecordingAssetsAheadOfTime(recorders, api, dispatchBackgroundActions) {
-    const uploadingAssets = api.uploadRecordingAssets(recorders);
+function uploadRecordingAssetsAheadOfTime(recorders, fullstack, api, dispatchBackgroundActions) {
+    const uploadingAssets = api.uploadRecordingAssets(recorders, fullstack);
     dispatchBackgroundActions.uploadingAssets(uploadingAssets);
 }
 exports.uploadRecordingAssetsAheadOfTime = uploadRecordingAssetsAheadOfTime;
@@ -2452,10 +2659,10 @@ function waitForReportToFinishProcessing(api, report_id, settings) {
         check();
     });
 }
-function uploadReportAssets(report, api) {
+function uploadReportAssets(report, api, fullstack) {
     const { recorders, screenshots } = report;
     if (recorders) {
-        return report.uploadingAssets || api.uploadRecordingAssets(recorders);
+        return (report.uploadingAssets || api.uploadRecordingAssets(recorders, fullstack));
     }
     if (screenshots.length) {
         return Promise.all(screenshots.map((screenshot) => __awaiter(this, void 0, void 0, function* () {
@@ -2466,7 +2673,7 @@ function uploadReportAssets(report, api) {
     throw new Error('A report must have either recorders or screenshots');
 }
 exports.uploadReportAssets = uploadReportAssets;
-function doSubmitReport(navigator, report, api, settings, dispatchBackgroundActions, setReportId // Set the report id so that even if creating the report times out or fails we can clean up the partially created report
+function doSubmitReport(navigator, report, api, settings, fullstack, dispatchBackgroundActions, setReportId // Set the report id so that even if creating the report times out or fails we can clean up the partially created report
 ) {
     return __awaiter(this, void 0, void 0, function* () {
         let networkTrafficUploadError = null;
@@ -2474,12 +2681,14 @@ function doSubmitReport(navigator, report, api, settings, dispatchBackgroundActi
         const { recorders, tab } = report;
         const networkBuffer = recorders && recorders.tab.network.buffer;
         const consoleData = recorders && recorders.tab.console.data;
+        const fullstackData = fullstack && fullstack.uuid != '';
         const sourceMapHash = recorders && recorders.tab.console.sourceMapHash;
-        const assets = yield uploadReportAssets(report, api);
+        const assets = yield uploadReportAssets(report, api, fullstack);
         let reportData = {
             source_url: tab.url,
             user_agent: navigator.userAgent,
             has_console_logs: !!consoleData,
+            has_fullstack: !!fullstackData,
             has_network_traffic: !!networkBuffer,
             created_via_extension: true,
             assets: JSON.stringify(assets),
@@ -2494,6 +2703,7 @@ function doSubmitReport(navigator, report, api, settings, dispatchBackgroundActi
             test_hierarchy: report.details.test_hierarchy,
             test_passed: report.details.test_passed,
             test_run_id: report.details.test_run_id,
+            fullstack_uuid: !!fullstackData ? fullstack.uuid : '',
         };
         if (reportData.source_url == 'about:blank') {
             delete reportData.source_url;
@@ -2546,12 +2756,12 @@ function doSubmitReport(navigator, report, api, settings, dispatchBackgroundActi
     });
 }
 exports.doSubmitReport = doSubmitReport;
-function submitReport(navigator, report, api, settings, dispatchBackgroundActions) {
+function submitReport(navigator, report, api, settings, fullstack, dispatchBackgroundActions) {
     return __awaiter(this, void 0, void 0, function* () {
         let report_id;
         try {
             const { processedReport, networkTrafficUploadError, } = yield Promise.race([
-                doSubmitReport(navigator, report, api, settings, dispatchBackgroundActions, r => {
+                doSubmitReport(navigator, report, api, settings, fullstack, dispatchBackgroundActions, r => {
                     report_id = r;
                 }),
                 new Promise((_resolve, reject) => setTimeout(() => reject({ message: 'Timed out creating report.' }), settings.maxSecondsProcessing * 1000)),
@@ -2570,7 +2780,7 @@ function submitReport(navigator, report, api, settings, dispatchBackgroundAction
 }
 exports.submitReport = submitReport;
 
-},{}],14:[function(require,module,exports){
+},{}],15:[function(require,module,exports){
 "use strict";
 var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
     function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
@@ -2595,7 +2805,7 @@ function checkReports(api, dispatchBackgroundActions) {
 }
 exports.checkReports = checkReports;
 
-},{}],15:[function(require,module,exports){
+},{}],16:[function(require,module,exports){
 "use strict";
 var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
     function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
@@ -2645,7 +2855,7 @@ function takeScreenshot(tab, tabs, dispatchBackgroundActions) {
 }
 exports.takeScreenshot = takeScreenshot;
 
-},{}],16:[function(require,module,exports){
+},{}],17:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 function getExtensionVersion() {
@@ -2666,7 +2876,7 @@ exports.settings = {
     extensionVersion: getExtensionVersion(),
 };
 
-},{}],17:[function(require,module,exports){
+},{}],18:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 const redux = require("redux");
@@ -2674,6 +2884,7 @@ const lodash_1 = require("lodash");
 const errors = require("./errors");
 const utils_1 = require("../utils");
 const api_1 = require("./api");
+const uuid_1 = require("uuid");
 const emptyState = {
     zendeskPort: undefined,
     fbbInit: true,
@@ -2694,6 +2905,7 @@ const emptyState = {
         stoppedByUser: false,
         started: false,
         stopped: false,
+        uuid: '',
     },
     report: {
         started: false,
@@ -2712,7 +2924,15 @@ const emptyState = {
     },
     recordMode: 'tab',
     recordMic: false,
+    recordVideo: false,
     countdownTimer: false,
+    hasFullstack: false,
+    fullstack: {
+        base_offset: undefined,
+        success: false,
+        items: undefined,
+        uuid: '',
+    },
 };
 const reportStarted = ({ userInfoResponse }) => {
     const fbbext = window.fbbext;
@@ -2808,6 +3028,9 @@ function reducer(settings, api, initialState = emptyState, action) {
         case 'SET_RECORD_MIC': {
             return Object.assign(Object.assign({}, initialState), { recordMic: action.payload.recordMic });
         }
+        case 'SET_RECORD_VIDEO': {
+            return Object.assign(Object.assign({}, initialState), { recordVideo: action.payload.recordVideo });
+        }
         case 'SET_COUNTDOWN_TIMER': {
             return Object.assign(Object.assign({}, initialState), { countdownTimer: action.payload.countdownTimer });
         }
@@ -2821,12 +3044,14 @@ function reducer(settings, api, initialState = emptyState, action) {
             if (!initialState.popup.activeTab) {
                 return Object.assign(Object.assign({}, initialState), { alert: 'Cannot start recording as active tab not detected. Please close and re-open the extension, then retry.' });
             }
+            const generatedUUID = uuid_1.v4();
             return Object.assign(Object.assign({}, initialState), { recording: {
                     type: action.type === 'CLICK_START_RECORDING_TAB' ? 'tab' : 'screen',
                     startedByUser: true,
                     stoppedByUser: false,
                     started: false,
                     stopped: false,
+                    uuid: generatedUUID,
                 } });
         }
         case 'CLICK_STOP_RECORDING':
@@ -2954,7 +3179,11 @@ function reducer(settings, api, initialState = emptyState, action) {
             return Object.assign(Object.assign({}, initialState), { alert: logErrorAndReturnCopyForUser(settings, api, initialState, action) });
         }
         case 'USER_INFO_RETRIEVAL_SUCCESS': {
-            return Object.assign(Object.assign({}, initialState), { userInfoResponse: action.payload.userInfoResponse });
+            const hasFullstack = action.payload.userInfoResponse &&
+                action.payload.userInfoResponse.loggedIn
+                ? action.payload.userInfoResponse.userInfo.can_use_fullstack
+                : false;
+            return Object.assign(Object.assign({}, initialState), { userInfoResponse: action.payload.userInfoResponse, hasFullstack: hasFullstack });
         }
         case 'TRIAL_STATUS_RETRIEVAL_SUCCESS': {
             return Object.assign(Object.assign({}, initialState), { trialStatusResponse: action.payload.trialStatusResponse });
@@ -2963,7 +3192,10 @@ function reducer(settings, api, initialState = emptyState, action) {
             return Object.assign(Object.assign({}, initialState), { alert: logErrorAndReturnCopyForUser(settings, api, initialState, action) });
         }
         case 'FBB_TOKEN_INFO_RETRIEVAL_SUCCESS': {
-            return Object.assign(Object.assign({}, initialState), { fbbTokenResponse: action.payload.fbbTokenResponse });
+            const hasFullstack = action.payload.fbbTokenResponse
+                ? action.payload.fbbTokenResponse.canUseFullstack
+                : false;
+            return Object.assign(Object.assign({}, initialState), { fbbTokenResponse: action.payload.fbbTokenResponse, hasFullstack: hasFullstack });
         }
         case 'FBB_TOKEN_INFO_RETRIEVAL_FAILURE': {
             return Object.assign(Object.assign({}, initialState), { fbbTokenResponse: {
@@ -3061,7 +3293,7 @@ function reducer(settings, api, initialState = emptyState, action) {
             return Object.assign(Object.assign({}, initialState), { recording: emptyState.recording, alert: logErrorAndReturnCopyForUser(settings, api, initialState, action) });
         }
         case 'RECORDING_STOP': {
-            return Object.assign(Object.assign({}, initialState), { report: reportStarted(initialState), recording: {
+            return Object.assign(Object.assign({}, initialState), { report: reportStarted(initialState), recordVideo: false, recording: {
                     startedByUser: true,
                     stoppedByUser: true,
                     started: true,
@@ -3090,6 +3322,16 @@ function reducer(settings, api, initialState = emptyState, action) {
             api_1.setApiKey(action.payload);
             return initialState;
         }
+        case 'FULLSTACK_SUCCESS': {
+            return Object.assign(Object.assign({}, initialState), { fullstack: action.payload.fullstack });
+        }
+        case 'FULLSTACK_STOP': {
+            return Object.assign(Object.assign({}, initialState), { fullstack: action.payload.fullstack });
+        }
+        case 'FULLSTACK_FAILURE': {
+            return initialState;
+            // console.log("Fullstack Failure") //TODO: Fabio
+        }
         default: {
             const faultyAction = action;
             if (!/^@@redux/.test(faultyAction.type)) {
@@ -3112,7 +3354,7 @@ function createStore(settings, api) {
 }
 exports.createStore = createStore;
 
-},{"../utils":24,"./api":2,"./errors":4,"lodash":28,"redux":30}],18:[function(require,module,exports){
+},{"../utils":25,"./api":2,"./errors":4,"lodash":29,"redux":31,"uuid":38}],19:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 const actions_1 = require("./actions");
@@ -3120,12 +3362,59 @@ const tab_1 = require("./tab");
 const recording_1 = require("./recording");
 const report_1 = require("./report");
 const user_1 = require("./user");
+const fullstack_1 = require("./fullstack");
 const fbb_1 = require("./fbb");
 const reports_1 = require("./reports");
 const integrations_1 = require("./integrations");
 const screenshot_1 = require("./screenshot");
 const system_info_1 = require("./system-info");
 const timer_1 = require("./timer");
+let activeTabURL = ''; // tslint:disable-line:readonly-array
+let br_recording = false;
+let recordVideo = false;
+const injectCamera = () => {
+    chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
+        const currentTab = tabs[0];
+        const tabId = currentTab.id;
+        chrome.tabs.executeScript(tabId, {
+            file: '/bundled/jquery.min.js',
+        }, () => {
+            console.log('Inserted /bundled/jquery.min.js');
+            chrome.tabs.executeScript(tabId, {
+                file: '/bundled/background/camera/content.js',
+            }, () => {
+                console.log('Inserted /src/background/camera/content.js');
+                chrome.tabs.insertCSS(tabId, {
+                    file: '/css/content.css',
+                }, () => {
+                    console.log('Inserted /css/content.css');
+                });
+            });
+        });
+        activeTabURL = currentTab.url;
+    });
+};
+// Inject content when tab redirects while recording
+const pageUpdated = sender => {
+    chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
+        const currentTab = tabs[0];
+        if (tabs.length > 0 &&
+            // @ts-ignore
+            currentTab.url.indexOf('firefox-extension-get-user-media-launcher.html') >
+                -1) {
+            return;
+        }
+        if (
+        // tabs.length > 0 &&
+        // sender.tab.id === tabs[0].id &&
+        activeTabURL !== currentTab.url &&
+            recordVideo &&
+            br_recording // only inject camera on url change when recording is active
+        ) {
+            injectCamera();
+        }
+    });
+};
 function subscribe(baseUrl, apiBaseUrl, settings, store, navigator, screen, browser, tabs, tabCapture, desktopCapture, browserAction, MediaRecorder, Blob, chrome, api, notifications, capabilities) {
     const dispatchBackgroundActions = actions_1.actions(store.dispatch);
     const timer = timer_1.createTimer(browserAction);
@@ -3178,16 +3467,22 @@ function subscribe(baseUrl, apiBaseUrl, settings, store, navigator, screen, brow
             !prevState.screenshot.requestedByUser) {
             screenshot_1.takeScreenshot(nextState.popup.activeTab, tabs, dispatchBackgroundActions);
         }
-        // Start recording when the user clicks record
+        // Start recording when the user clicks record TODO: Fabio send start_recording to api
         if (nextState.recording.startedByUser &&
             !prevState.recording.startedByUser) {
-            recording_1.startRecording(browser, baseUrl, apiBaseUrl, nextState.popup.activeTab, nextState.recording.type, navigator, screen, tabCapture, desktopCapture, MediaRecorder, Blob, chrome, capabilities, dispatchBackgroundActions, nextState.recordMic, nextState.countdownTimer);
+            br_recording = true;
+            recordVideo = nextState.recordVideo;
+            recording_1.startRecording(browser, baseUrl, apiBaseUrl, nextState.popup.activeTab, nextState.recording.type, navigator, screen, tabCapture, desktopCapture, MediaRecorder, Blob, chrome, capabilities, dispatchBackgroundActions, nextState.recordMic, nextState.countdownTimer, nextState.hasFullstack ? nextState.recording.uuid : '', nextState.recordVideo);
         }
-        // Stop recording when the user clicks stop
+        // Stop recording when the user clicks stop TODO: Fabio send stop_recording to api
         if (nextState.recording.stoppedByUser &&
             !prevState.recording.stoppedByUser) {
-            if (prevState.countdownTimer == true &&
-                prevState.recording.started == false) {
+            br_recording = false;
+            activeTabURL = ''; // reset the active tab when recording is stopped
+            if (prevState.countdownTimer === true &&
+                prevState.recording.started === false) {
+                // console.log("Here: Recording stopped by user. Resending sendUUID to refresh ")
+                // This will not work because the whole fullstackResponse will be reset. Need to delay: TODO: Fabio
                 browserAction.setBadgeText({ text: '' });
                 nextState.recording.cancel();
             }
@@ -3195,9 +3490,13 @@ function subscribe(baseUrl, apiBaseUrl, settings, store, navigator, screen, brow
                 nextState.recording.stop();
             }
         }
-        // Start the timer when the recording starts
+        // Start the timer when the recording starts TODO: Fabio get date.now() and store it
         if (nextState.recording.started && !prevState.recording.started) {
             timer.start();
+            if (prevState.hasFullstack) {
+                console.log('Has Fullstack. StartRecording called...');
+                fullstack_1.startRecordingFullstack(api, nextState.recording.uuid, dispatchBackgroundActions);
+            }
         }
         // Stop the timer when the recording stops
         if (nextState.recording.stopped && !prevState.recording.stopped) {
@@ -3207,13 +3506,18 @@ function subscribe(baseUrl, apiBaseUrl, settings, store, navigator, screen, brow
                 browserAction.setBadgeBackgroundColor({ color: '#FF0000' });
             }
             // Upload the recording assets ahead of time if that setting is on
+            let fullstackObj;
+            if (prevState.hasFullstack) {
+                fullstackObj = prevState.fullstack;
+                fullstackObj['uuid'] = prevState.recording.uuid;
+            }
             if (settings.uploadRecordingAssetsAheadOfTime) {
-                report_1.uploadRecordingAssetsAheadOfTime(nextState.recording.recorders, api, dispatchBackgroundActions);
+                report_1.uploadRecordingAssetsAheadOfTime(nextState.recording.recorders, fullstackObj, api, dispatchBackgroundActions);
             }
         }
         // Process any report just added to the processing queue
         if (nextState.reports.processing.length > prevState.reports.processing.length) {
-            report_1.submitReport(navigator, nextState.reports.processing[0], api, settings, dispatchBackgroundActions);
+            report_1.submitReport(navigator, nextState.reports.processing[0], api, settings, nextState.fullstack, dispatchBackgroundActions);
         }
         if (prevState.reports.processing.length &&
             prevState.reports.processing.length -
@@ -3232,24 +3536,54 @@ function subscribe(baseUrl, apiBaseUrl, settings, store, navigator, screen, brow
             notifications.create(nextState.reports.processed[0]);
         }
         // If mic enabled changes make sure we have access to the mic
-        if (nextState.recordMic == true &&
-            prevState.recordMic == false &&
+        if (nextState.recordMic === true &&
+            prevState.recordMic === false &&
             !capabilities.isFirefox) {
             navigator.permissions
                 .query({ name: 'microphone' })
-                .then(function (permissionStatus) {
-                if (permissionStatus.state != 'granted') {
+                .then(permissionStatus => {
+                if (permissionStatus.state !== 'granted') {
                     chrome.tabs.create({
                         url: chrome.extension.getURL('/html/authorize.html'),
                     });
                 }
             });
         }
+        // If camera enabled changes make sure we have access to the camera
+        if (nextState.recordVideo === true &&
+            prevState.recordVideo === false &&
+            !capabilities.isFirefox) {
+            navigator.permissions.query({ name: 'camera' }).then(permissionStatus => {
+                if (permissionStatus.state !== 'granted') {
+                    chrome.tabs.create({
+                        url: chrome.extension.getURL('/html/authorize-camera.html'),
+                    });
+                }
+                else if (permissionStatus.state === 'granted') {
+                    injectCamera();
+                }
+            });
+        }
+        // send message to remove injected camera from DOM when record video swtich is turned off
+        if (nextState.recordVideo === false && prevState.recordVideo === true) {
+            chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
+                chrome.tabs.sendMessage(tabs[0].id, {
+                    type: 'end',
+                });
+            });
+        }
     });
 }
 exports.subscribe = subscribe;
+// listens to message when tab is loaded
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message.type === 'sources-loaded') {
+        console.log(`message.type === 'sources-loaded'`);
+        pageUpdated(sender);
+    }
+});
 
-},{"./actions":1,"./fbb":5,"./integrations":6,"./recording":9,"./report":13,"./reports":14,"./screenshot":15,"./system-info":19,"./tab":20,"./timer":21,"./user":22}],19:[function(require,module,exports){
+},{"./actions":1,"./fbb":5,"./fullstack":6,"./integrations":7,"./recording":10,"./report":14,"./reports":15,"./screenshot":16,"./system-info":20,"./tab":21,"./timer":22,"./user":23}],20:[function(require,module,exports){
 "use strict";
 var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
     function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
@@ -3328,7 +3662,7 @@ function checkSystemInfo(navigator, chrome, tabs, tab, dispatch) {
 }
 exports.checkSystemInfo = checkSystemInfo;
 
-},{}],20:[function(require,module,exports){
+},{}],21:[function(require,module,exports){
 "use strict";
 var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
     function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
@@ -3363,7 +3697,7 @@ function checkActiveTab(tabs, dispatchBackgroundActions) {
 }
 exports.checkActiveTab = checkActiveTab;
 
-},{}],21:[function(require,module,exports){
+},{}],22:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 const browser_detection_1 = require("../browser-detection");
@@ -3427,7 +3761,7 @@ function createTimer(browserAction) {
 }
 exports.createTimer = createTimer;
 
-},{"../browser-detection":23}],22:[function(require,module,exports){
+},{"../browser-detection":24}],23:[function(require,module,exports){
 "use strict";
 var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
     function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
@@ -3464,7 +3798,7 @@ function checkCurrentTrialStatus(api, dispatchBackgroundActions) {
 }
 exports.checkCurrentTrialStatus = checkCurrentTrialStatus;
 
-},{}],23:[function(require,module,exports){
+},{}],24:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 function majorVersion(browser, navigator) {
@@ -3521,7 +3855,7 @@ function detectCapabilities(browser, navigator) {
 }
 exports.capabilities = detectCapabilities(browser, navigator);
 
-},{}],24:[function(require,module,exports){
+},{}],25:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 function randId() {
@@ -3533,7 +3867,7 @@ function randId() {
 }
 exports.randId = randId;
 
-},{}],25:[function(require,module,exports){
+},{}],26:[function(require,module,exports){
 /**
  * The code was extracted from:
  * https://github.com/davidchambers/Base64.js
@@ -3573,7 +3907,7 @@ function polyfill (input) {
 
 module.exports = typeof window !== 'undefined' && window.atob && window.atob.bind(window) || polyfill;
 
-},{}],26:[function(require,module,exports){
+},{}],27:[function(require,module,exports){
 var atob = require('./atob');
 
 function b64DecodeUnicode(str) {
@@ -3608,7 +3942,7 @@ module.exports = function(str) {
   }
 };
 
-},{"./atob":25}],27:[function(require,module,exports){
+},{"./atob":26}],28:[function(require,module,exports){
 'use strict';
 
 var base64_url_decode = require('./base64_url_decode');
@@ -3636,8 +3970,8 @@ module.exports = function (token,options) {
 
 module.exports.InvalidTokenError = InvalidTokenError;
 
-},{"./base64_url_decode":26}],28:[function(require,module,exports){
-(function (global){(function (){
+},{"./base64_url_decode":27}],29:[function(require,module,exports){
+(function (global){
 /**
  * @license
  * Lodash <https://lodash.com/>
@@ -3652,7 +3986,7 @@ module.exports.InvalidTokenError = InvalidTokenError;
   var undefined;
 
   /** Used as the semantic version number. */
-  var VERSION = '4.17.20';
+  var VERSION = '4.17.15';
 
   /** Used as the size to enable large array optimizations. */
   var LARGE_ARRAY_SIZE = 200;
@@ -7359,21 +7693,8 @@ module.exports.InvalidTokenError = InvalidTokenError;
      * @returns {Array} Returns the new sorted array.
      */
     function baseOrderBy(collection, iteratees, orders) {
-      if (iteratees.length) {
-        iteratees = arrayMap(iteratees, function(iteratee) {
-          if (isArray(iteratee)) {
-            return function(value) {
-              return baseGet(value, iteratee.length === 1 ? iteratee[0] : iteratee);
-            }
-          }
-          return iteratee;
-        });
-      } else {
-        iteratees = [identity];
-      }
-
       var index = -1;
-      iteratees = arrayMap(iteratees, baseUnary(getIteratee()));
+      iteratees = arrayMap(iteratees.length ? iteratees : [identity], baseUnary(getIteratee()));
 
       var result = baseMap(collection, function(value, key, collection) {
         var criteria = arrayMap(iteratees, function(iteratee) {
@@ -7630,10 +7951,6 @@ module.exports.InvalidTokenError = InvalidTokenError;
         var key = toKey(path[index]),
             newValue = value;
 
-        if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
-          return object;
-        }
-
         if (index != lastIndex) {
           var objValue = nested[key];
           newValue = customizer ? customizer(objValue, key, nested) : undefined;
@@ -7786,14 +8103,11 @@ module.exports.InvalidTokenError = InvalidTokenError;
      *  into `array`.
      */
     function baseSortedIndexBy(array, value, iteratee, retHighest) {
-      var low = 0,
-          high = array == null ? 0 : array.length;
-      if (high === 0) {
-        return 0;
-      }
-
       value = iteratee(value);
-      var valIsNaN = value !== value,
+
+      var low = 0,
+          high = array == null ? 0 : array.length,
+          valIsNaN = value !== value,
           valIsNull = value === null,
           valIsSymbol = isSymbol(value),
           valIsUndefined = value === undefined;
@@ -9278,11 +9592,10 @@ module.exports.InvalidTokenError = InvalidTokenError;
       if (arrLength != othLength && !(isPartial && othLength > arrLength)) {
         return false;
       }
-      // Check that cyclic values are equal.
-      var arrStacked = stack.get(array);
-      var othStacked = stack.get(other);
-      if (arrStacked && othStacked) {
-        return arrStacked == other && othStacked == array;
+      // Assume cyclic values are equal.
+      var stacked = stack.get(array);
+      if (stacked && stack.get(other)) {
+        return stacked == other;
       }
       var index = -1,
           result = true,
@@ -9444,11 +9757,10 @@ module.exports.InvalidTokenError = InvalidTokenError;
           return false;
         }
       }
-      // Check that cyclic values are equal.
-      var objStacked = stack.get(object);
-      var othStacked = stack.get(other);
-      if (objStacked && othStacked) {
-        return objStacked == other && othStacked == object;
+      // Assume cyclic values are equal.
+      var stacked = stack.get(object);
+      if (stacked && stack.get(other)) {
+        return stacked == other;
       }
       var result = true;
       stack.set(object, other);
@@ -12829,10 +13141,6 @@ module.exports.InvalidTokenError = InvalidTokenError;
      * // The `_.property` iteratee shorthand.
      * _.filter(users, 'active');
      * // => objects for ['barney']
-     *
-     * // Combining several predicates using `_.overEvery` or `_.overSome`.
-     * _.filter(users, _.overSome([{ 'age': 36 }, ['age', 40]]));
-     * // => objects for ['fred', 'barney']
      */
     function filter(collection, predicate) {
       var func = isArray(collection) ? arrayFilter : baseFilter;
@@ -13582,15 +13890,15 @@ module.exports.InvalidTokenError = InvalidTokenError;
      * var users = [
      *   { 'user': 'fred',   'age': 48 },
      *   { 'user': 'barney', 'age': 36 },
-     *   { 'user': 'fred',   'age': 30 },
+     *   { 'user': 'fred',   'age': 40 },
      *   { 'user': 'barney', 'age': 34 }
      * ];
      *
      * _.sortBy(users, [function(o) { return o.user; }]);
-     * // => objects for [['barney', 36], ['barney', 34], ['fred', 48], ['fred', 30]]
+     * // => objects for [['barney', 36], ['barney', 34], ['fred', 48], ['fred', 40]]
      *
      * _.sortBy(users, ['user', 'age']);
-     * // => objects for [['barney', 34], ['barney', 36], ['fred', 30], ['fred', 48]]
+     * // => objects for [['barney', 34], ['barney', 36], ['fred', 40], ['fred', 48]]
      */
     var sortBy = baseRest(function(collection, iteratees) {
       if (collection == null) {
@@ -18465,11 +18773,11 @@ module.exports.InvalidTokenError = InvalidTokenError;
 
       // Use a sourceURL for easier debugging.
       // The sourceURL gets injected into the source that's eval-ed, so be careful
-      // to normalize all kinds of whitespace, so e.g. newlines (and unicode versions of it) can't sneak in
-      // and escape the comment, thus injecting code that gets evaled.
+      // with lookup (in case of e.g. prototype pollution), and strip newlines if any.
+      // A newline wouldn't be a valid sourceURL anyway, and it'd enable code injection.
       var sourceURL = '//# sourceURL=' +
         (hasOwnProperty.call(options, 'sourceURL')
-          ? (options.sourceURL + '').replace(/\s/g, ' ')
+          ? (options.sourceURL + '').replace(/[\r\n]/g, ' ')
           : ('lodash.templateSources[' + (++templateCounter) + ']')
         ) + '\n';
 
@@ -18502,6 +18810,8 @@ module.exports.InvalidTokenError = InvalidTokenError;
 
       // If `variable` is not specified wrap a with-statement around the generated
       // code to add the data object to the top of the scope chain.
+      // Like with sourceURL, we take care to not check the option's prototype,
+      // as this configuration is a code injection vector.
       var variable = hasOwnProperty.call(options, 'variable') && options.variable;
       if (!variable) {
         source = 'with (obj) {\n' + source + '\n}\n';
@@ -19208,9 +19518,6 @@ module.exports.InvalidTokenError = InvalidTokenError;
      * values against any array or object value, respectively. See `_.isEqual`
      * for a list of supported value comparisons.
      *
-     * **Note:** Multiple values can be checked by combining several matchers
-     * using `_.overSome`
-     *
      * @static
      * @memberOf _
      * @since 3.0.0
@@ -19226,10 +19533,6 @@ module.exports.InvalidTokenError = InvalidTokenError;
      *
      * _.filter(objects, _.matches({ 'a': 4, 'c': 6 }));
      * // => [{ 'a': 4, 'b': 5, 'c': 6 }]
-     *
-     * // Checking for several possible values
-     * _.filter(objects, _.overSome([_.matches({ 'a': 1 }), _.matches({ 'a': 4 })]));
-     * // => [{ 'a': 1, 'b': 2, 'c': 3 }, { 'a': 4, 'b': 5, 'c': 6 }]
      */
     function matches(source) {
       return baseMatches(baseClone(source, CLONE_DEEP_FLAG));
@@ -19243,9 +19546,6 @@ module.exports.InvalidTokenError = InvalidTokenError;
      * **Note:** Partial comparisons will match empty array and empty object
      * `srcValue` values against any array or object value, respectively. See
      * `_.isEqual` for a list of supported value comparisons.
-     *
-     * **Note:** Multiple values can be checked by combining several matchers
-     * using `_.overSome`
      *
      * @static
      * @memberOf _
@@ -19263,10 +19563,6 @@ module.exports.InvalidTokenError = InvalidTokenError;
      *
      * _.find(objects, _.matchesProperty('a', 4));
      * // => { 'a': 4, 'b': 5, 'c': 6 }
-     *
-     * // Checking for several possible values
-     * _.filter(objects, _.overSome([_.matchesProperty('a', 1), _.matchesProperty('a', 4)]));
-     * // => [{ 'a': 1, 'b': 2, 'c': 3 }, { 'a': 4, 'b': 5, 'c': 6 }]
      */
     function matchesProperty(path, srcValue) {
       return baseMatchesProperty(path, baseClone(srcValue, CLONE_DEEP_FLAG));
@@ -19490,10 +19786,6 @@ module.exports.InvalidTokenError = InvalidTokenError;
      * Creates a function that checks if **all** of the `predicates` return
      * truthy when invoked with the arguments it receives.
      *
-     * Following shorthands are possible for providing predicates.
-     * Pass an `Object` and it will be used as an parameter for `_.matches` to create the predicate.
-     * Pass an `Array` of parameters for `_.matchesProperty` and the predicate will be created using them.
-     *
      * @static
      * @memberOf _
      * @since 4.0.0
@@ -19520,10 +19812,6 @@ module.exports.InvalidTokenError = InvalidTokenError;
      * Creates a function that checks if **any** of the `predicates` return
      * truthy when invoked with the arguments it receives.
      *
-     * Following shorthands are possible for providing predicates.
-     * Pass an `Object` and it will be used as an parameter for `_.matches` to create the predicate.
-     * Pass an `Array` of parameters for `_.matchesProperty` and the predicate will be created using them.
-     *
      * @static
      * @memberOf _
      * @since 4.0.0
@@ -19543,9 +19831,6 @@ module.exports.InvalidTokenError = InvalidTokenError;
      *
      * func(NaN);
      * // => false
-     *
-     * var matchesFunc = _.overSome([{ 'a': 1 }, { 'a': 2 }])
-     * var matchesPropertyFunc = _.overSome([['a', 1], ['a', 2]])
      */
     var overSome = createOver(arraySome);
 
@@ -20800,8 +21085,8 @@ module.exports.InvalidTokenError = InvalidTokenError;
   }
 }.call(this));
 
-}).call(this)}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}],29:[function(require,module,exports){
+}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+},{}],30:[function(require,module,exports){
 // shim for using process in browser
 var process = module.exports = {};
 
@@ -20987,8 +21272,8 @@ process.chdir = function (dir) {
 };
 process.umask = function() { return 0; };
 
-},{}],30:[function(require,module,exports){
-(function (process){(function (){
+},{}],31:[function(require,module,exports){
+(function (process){
 'use strict';
 
 Object.defineProperty(exports, '__esModule', { value: true });
@@ -21637,9 +21922,9 @@ exports.applyMiddleware = applyMiddleware;
 exports.compose = compose;
 exports.__DO_NOT_USE__ActionTypes = ActionTypes;
 
-}).call(this)}).call(this,require('_process'))
-},{"_process":29,"symbol-observable":31}],31:[function(require,module,exports){
-(function (global){(function (){
+}).call(this,require('_process'))
+},{"_process":30,"symbol-observable":32}],32:[function(require,module,exports){
+(function (global){
 'use strict';
 
 Object.defineProperty(exports, "__esModule", {
@@ -21669,8 +21954,8 @@ if (typeof self !== 'undefined') {
 
 var result = (0, _ponyfill2['default'])(root);
 exports['default'] = result;
-}).call(this)}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./ponyfill.js":32}],32:[function(require,module,exports){
+}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+},{"./ponyfill.js":33}],33:[function(require,module,exports){
 'use strict';
 
 Object.defineProperty(exports, "__esModule", {
@@ -21694,7 +21979,7 @@ function symbolObservablePonyfill(root) {
 
 	return result;
 };
-},{}],33:[function(require,module,exports){
+},{}],34:[function(require,module,exports){
 /*!
  * URI.js - Mutating URLs
  * IPv6 Support
@@ -21881,7 +22166,7 @@ function symbolObservablePonyfill(root) {
   };
 }));
 
-},{}],34:[function(require,module,exports){
+},{}],35:[function(require,module,exports){
 /*!
  * URI.js - Mutating URLs
  * Second Level Domain (SLD) Support
@@ -22128,7 +22413,7 @@ function symbolObservablePonyfill(root) {
   return SLD;
 }));
 
-},{}],35:[function(require,module,exports){
+},{}],36:[function(require,module,exports){
 /*!
  * URI.js - Mutating URLs
  *
@@ -24468,8 +24753,8 @@ function symbolObservablePonyfill(root) {
   return URI;
 }));
 
-},{"./IPv6":33,"./SecondLevelDomains":34,"./punycode":36}],36:[function(require,module,exports){
-(function (global){(function (){
+},{"./IPv6":34,"./SecondLevelDomains":35,"./punycode":37}],37:[function(require,module,exports){
+(function (global){
 /*! https://mths.be/punycode v1.4.0 by @mathias */
 ;(function(root) {
 
@@ -25004,5 +25289,844 @@ function symbolObservablePonyfill(root) {
 
 }(this));
 
-}).call(this)}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}]},{},[3]);
+}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+},{}],38:[function(require,module,exports){
+"use strict";
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+Object.defineProperty(exports, "v1", {
+  enumerable: true,
+  get: function () {
+    return _v.default;
+  }
+});
+Object.defineProperty(exports, "v3", {
+  enumerable: true,
+  get: function () {
+    return _v2.default;
+  }
+});
+Object.defineProperty(exports, "v4", {
+  enumerable: true,
+  get: function () {
+    return _v3.default;
+  }
+});
+Object.defineProperty(exports, "v5", {
+  enumerable: true,
+  get: function () {
+    return _v4.default;
+  }
+});
+Object.defineProperty(exports, "NIL", {
+  enumerable: true,
+  get: function () {
+    return _nil.default;
+  }
+});
+Object.defineProperty(exports, "version", {
+  enumerable: true,
+  get: function () {
+    return _version.default;
+  }
+});
+Object.defineProperty(exports, "validate", {
+  enumerable: true,
+  get: function () {
+    return _validate.default;
+  }
+});
+Object.defineProperty(exports, "stringify", {
+  enumerable: true,
+  get: function () {
+    return _stringify.default;
+  }
+});
+Object.defineProperty(exports, "parse", {
+  enumerable: true,
+  get: function () {
+    return _parse.default;
+  }
+});
+
+var _v = _interopRequireDefault(require("./v1.js"));
+
+var _v2 = _interopRequireDefault(require("./v3.js"));
+
+var _v3 = _interopRequireDefault(require("./v4.js"));
+
+var _v4 = _interopRequireDefault(require("./v5.js"));
+
+var _nil = _interopRequireDefault(require("./nil.js"));
+
+var _version = _interopRequireDefault(require("./version.js"));
+
+var _validate = _interopRequireDefault(require("./validate.js"));
+
+var _stringify = _interopRequireDefault(require("./stringify.js"));
+
+var _parse = _interopRequireDefault(require("./parse.js"));
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+},{"./nil.js":40,"./parse.js":41,"./stringify.js":45,"./v1.js":46,"./v3.js":47,"./v4.js":49,"./v5.js":50,"./validate.js":51,"./version.js":52}],39:[function(require,module,exports){
+"use strict";
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = void 0;
+
+/*
+ * Browser-compatible JavaScript MD5
+ *
+ * Modification of JavaScript MD5
+ * https://github.com/blueimp/JavaScript-MD5
+ *
+ * Copyright 2011, Sebastian Tschan
+ * https://blueimp.net
+ *
+ * Licensed under the MIT license:
+ * https://opensource.org/licenses/MIT
+ *
+ * Based on
+ * A JavaScript implementation of the RSA Data Security, Inc. MD5 Message
+ * Digest Algorithm, as defined in RFC 1321.
+ * Version 2.2 Copyright (C) Paul Johnston 1999 - 2009
+ * Other contributors: Greg Holt, Andrew Kepert, Ydnar, Lostinet
+ * Distributed under the BSD License
+ * See http://pajhome.org.uk/crypt/md5 for more info.
+ */
+function md5(bytes) {
+  if (typeof bytes === 'string') {
+    const msg = unescape(encodeURIComponent(bytes)); // UTF8 escape
+
+    bytes = new Uint8Array(msg.length);
+
+    for (let i = 0; i < msg.length; ++i) {
+      bytes[i] = msg.charCodeAt(i);
+    }
+  }
+
+  return md5ToHexEncodedArray(wordsToMd5(bytesToWords(bytes), bytes.length * 8));
+}
+/*
+ * Convert an array of little-endian words to an array of bytes
+ */
+
+
+function md5ToHexEncodedArray(input) {
+  const output = [];
+  const length32 = input.length * 32;
+  const hexTab = '0123456789abcdef';
+
+  for (let i = 0; i < length32; i += 8) {
+    const x = input[i >> 5] >>> i % 32 & 0xff;
+    const hex = parseInt(hexTab.charAt(x >>> 4 & 0x0f) + hexTab.charAt(x & 0x0f), 16);
+    output.push(hex);
+  }
+
+  return output;
+}
+/**
+ * Calculate output length with padding and bit length
+ */
+
+
+function getOutputLength(inputLength8) {
+  return (inputLength8 + 64 >>> 9 << 4) + 14 + 1;
+}
+/*
+ * Calculate the MD5 of an array of little-endian words, and a bit length.
+ */
+
+
+function wordsToMd5(x, len) {
+  /* append padding */
+  x[len >> 5] |= 0x80 << len % 32;
+  x[getOutputLength(len) - 1] = len;
+  let a = 1732584193;
+  let b = -271733879;
+  let c = -1732584194;
+  let d = 271733878;
+
+  for (let i = 0; i < x.length; i += 16) {
+    const olda = a;
+    const oldb = b;
+    const oldc = c;
+    const oldd = d;
+    a = md5ff(a, b, c, d, x[i], 7, -680876936);
+    d = md5ff(d, a, b, c, x[i + 1], 12, -389564586);
+    c = md5ff(c, d, a, b, x[i + 2], 17, 606105819);
+    b = md5ff(b, c, d, a, x[i + 3], 22, -1044525330);
+    a = md5ff(a, b, c, d, x[i + 4], 7, -176418897);
+    d = md5ff(d, a, b, c, x[i + 5], 12, 1200080426);
+    c = md5ff(c, d, a, b, x[i + 6], 17, -1473231341);
+    b = md5ff(b, c, d, a, x[i + 7], 22, -45705983);
+    a = md5ff(a, b, c, d, x[i + 8], 7, 1770035416);
+    d = md5ff(d, a, b, c, x[i + 9], 12, -1958414417);
+    c = md5ff(c, d, a, b, x[i + 10], 17, -42063);
+    b = md5ff(b, c, d, a, x[i + 11], 22, -1990404162);
+    a = md5ff(a, b, c, d, x[i + 12], 7, 1804603682);
+    d = md5ff(d, a, b, c, x[i + 13], 12, -40341101);
+    c = md5ff(c, d, a, b, x[i + 14], 17, -1502002290);
+    b = md5ff(b, c, d, a, x[i + 15], 22, 1236535329);
+    a = md5gg(a, b, c, d, x[i + 1], 5, -165796510);
+    d = md5gg(d, a, b, c, x[i + 6], 9, -1069501632);
+    c = md5gg(c, d, a, b, x[i + 11], 14, 643717713);
+    b = md5gg(b, c, d, a, x[i], 20, -373897302);
+    a = md5gg(a, b, c, d, x[i + 5], 5, -701558691);
+    d = md5gg(d, a, b, c, x[i + 10], 9, 38016083);
+    c = md5gg(c, d, a, b, x[i + 15], 14, -660478335);
+    b = md5gg(b, c, d, a, x[i + 4], 20, -405537848);
+    a = md5gg(a, b, c, d, x[i + 9], 5, 568446438);
+    d = md5gg(d, a, b, c, x[i + 14], 9, -1019803690);
+    c = md5gg(c, d, a, b, x[i + 3], 14, -187363961);
+    b = md5gg(b, c, d, a, x[i + 8], 20, 1163531501);
+    a = md5gg(a, b, c, d, x[i + 13], 5, -1444681467);
+    d = md5gg(d, a, b, c, x[i + 2], 9, -51403784);
+    c = md5gg(c, d, a, b, x[i + 7], 14, 1735328473);
+    b = md5gg(b, c, d, a, x[i + 12], 20, -1926607734);
+    a = md5hh(a, b, c, d, x[i + 5], 4, -378558);
+    d = md5hh(d, a, b, c, x[i + 8], 11, -2022574463);
+    c = md5hh(c, d, a, b, x[i + 11], 16, 1839030562);
+    b = md5hh(b, c, d, a, x[i + 14], 23, -35309556);
+    a = md5hh(a, b, c, d, x[i + 1], 4, -1530992060);
+    d = md5hh(d, a, b, c, x[i + 4], 11, 1272893353);
+    c = md5hh(c, d, a, b, x[i + 7], 16, -155497632);
+    b = md5hh(b, c, d, a, x[i + 10], 23, -1094730640);
+    a = md5hh(a, b, c, d, x[i + 13], 4, 681279174);
+    d = md5hh(d, a, b, c, x[i], 11, -358537222);
+    c = md5hh(c, d, a, b, x[i + 3], 16, -722521979);
+    b = md5hh(b, c, d, a, x[i + 6], 23, 76029189);
+    a = md5hh(a, b, c, d, x[i + 9], 4, -640364487);
+    d = md5hh(d, a, b, c, x[i + 12], 11, -421815835);
+    c = md5hh(c, d, a, b, x[i + 15], 16, 530742520);
+    b = md5hh(b, c, d, a, x[i + 2], 23, -995338651);
+    a = md5ii(a, b, c, d, x[i], 6, -198630844);
+    d = md5ii(d, a, b, c, x[i + 7], 10, 1126891415);
+    c = md5ii(c, d, a, b, x[i + 14], 15, -1416354905);
+    b = md5ii(b, c, d, a, x[i + 5], 21, -57434055);
+    a = md5ii(a, b, c, d, x[i + 12], 6, 1700485571);
+    d = md5ii(d, a, b, c, x[i + 3], 10, -1894986606);
+    c = md5ii(c, d, a, b, x[i + 10], 15, -1051523);
+    b = md5ii(b, c, d, a, x[i + 1], 21, -2054922799);
+    a = md5ii(a, b, c, d, x[i + 8], 6, 1873313359);
+    d = md5ii(d, a, b, c, x[i + 15], 10, -30611744);
+    c = md5ii(c, d, a, b, x[i + 6], 15, -1560198380);
+    b = md5ii(b, c, d, a, x[i + 13], 21, 1309151649);
+    a = md5ii(a, b, c, d, x[i + 4], 6, -145523070);
+    d = md5ii(d, a, b, c, x[i + 11], 10, -1120210379);
+    c = md5ii(c, d, a, b, x[i + 2], 15, 718787259);
+    b = md5ii(b, c, d, a, x[i + 9], 21, -343485551);
+    a = safeAdd(a, olda);
+    b = safeAdd(b, oldb);
+    c = safeAdd(c, oldc);
+    d = safeAdd(d, oldd);
+  }
+
+  return [a, b, c, d];
+}
+/*
+ * Convert an array bytes to an array of little-endian words
+ * Characters >255 have their high-byte silently ignored.
+ */
+
+
+function bytesToWords(input) {
+  if (input.length === 0) {
+    return [];
+  }
+
+  const length8 = input.length * 8;
+  const output = new Uint32Array(getOutputLength(length8));
+
+  for (let i = 0; i < length8; i += 8) {
+    output[i >> 5] |= (input[i / 8] & 0xff) << i % 32;
+  }
+
+  return output;
+}
+/*
+ * Add integers, wrapping at 2^32. This uses 16-bit operations internally
+ * to work around bugs in some JS interpreters.
+ */
+
+
+function safeAdd(x, y) {
+  const lsw = (x & 0xffff) + (y & 0xffff);
+  const msw = (x >> 16) + (y >> 16) + (lsw >> 16);
+  return msw << 16 | lsw & 0xffff;
+}
+/*
+ * Bitwise rotate a 32-bit number to the left.
+ */
+
+
+function bitRotateLeft(num, cnt) {
+  return num << cnt | num >>> 32 - cnt;
+}
+/*
+ * These functions implement the four basic operations the algorithm uses.
+ */
+
+
+function md5cmn(q, a, b, x, s, t) {
+  return safeAdd(bitRotateLeft(safeAdd(safeAdd(a, q), safeAdd(x, t)), s), b);
+}
+
+function md5ff(a, b, c, d, x, s, t) {
+  return md5cmn(b & c | ~b & d, a, b, x, s, t);
+}
+
+function md5gg(a, b, c, d, x, s, t) {
+  return md5cmn(b & d | c & ~d, a, b, x, s, t);
+}
+
+function md5hh(a, b, c, d, x, s, t) {
+  return md5cmn(b ^ c ^ d, a, b, x, s, t);
+}
+
+function md5ii(a, b, c, d, x, s, t) {
+  return md5cmn(c ^ (b | ~d), a, b, x, s, t);
+}
+
+var _default = md5;
+exports.default = _default;
+},{}],40:[function(require,module,exports){
+"use strict";
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = void 0;
+var _default = '00000000-0000-0000-0000-000000000000';
+exports.default = _default;
+},{}],41:[function(require,module,exports){
+"use strict";
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = void 0;
+
+var _validate = _interopRequireDefault(require("./validate.js"));
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+function parse(uuid) {
+  if (!(0, _validate.default)(uuid)) {
+    throw TypeError('Invalid UUID');
+  }
+
+  let v;
+  const arr = new Uint8Array(16); // Parse ########-....-....-....-............
+
+  arr[0] = (v = parseInt(uuid.slice(0, 8), 16)) >>> 24;
+  arr[1] = v >>> 16 & 0xff;
+  arr[2] = v >>> 8 & 0xff;
+  arr[3] = v & 0xff; // Parse ........-####-....-....-............
+
+  arr[4] = (v = parseInt(uuid.slice(9, 13), 16)) >>> 8;
+  arr[5] = v & 0xff; // Parse ........-....-####-....-............
+
+  arr[6] = (v = parseInt(uuid.slice(14, 18), 16)) >>> 8;
+  arr[7] = v & 0xff; // Parse ........-....-....-####-............
+
+  arr[8] = (v = parseInt(uuid.slice(19, 23), 16)) >>> 8;
+  arr[9] = v & 0xff; // Parse ........-....-....-....-############
+  // (Use "/" to avoid 32-bit truncation when bit-shifting high-order bytes)
+
+  arr[10] = (v = parseInt(uuid.slice(24, 36), 16)) / 0x10000000000 & 0xff;
+  arr[11] = v / 0x100000000 & 0xff;
+  arr[12] = v >>> 24 & 0xff;
+  arr[13] = v >>> 16 & 0xff;
+  arr[14] = v >>> 8 & 0xff;
+  arr[15] = v & 0xff;
+  return arr;
+}
+
+var _default = parse;
+exports.default = _default;
+},{"./validate.js":51}],42:[function(require,module,exports){
+"use strict";
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = void 0;
+var _default = /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|00000000-0000-0000-0000-000000000000)$/i;
+exports.default = _default;
+},{}],43:[function(require,module,exports){
+"use strict";
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = rng;
+// Unique ID creation requires a high quality random # generator. In the browser we therefore
+// require the crypto API and do not support built-in fallback to lower quality random number
+// generators (like Math.random()).
+let getRandomValues;
+const rnds8 = new Uint8Array(16);
+
+function rng() {
+  // lazy load so that environments that need to polyfill have a chance to do so
+  if (!getRandomValues) {
+    // getRandomValues needs to be invoked in a context where "this" is a Crypto implementation. Also,
+    // find the complete implementation of crypto (msCrypto) on IE11.
+    getRandomValues = typeof crypto !== 'undefined' && crypto.getRandomValues && crypto.getRandomValues.bind(crypto) || typeof msCrypto !== 'undefined' && typeof msCrypto.getRandomValues === 'function' && msCrypto.getRandomValues.bind(msCrypto);
+
+    if (!getRandomValues) {
+      throw new Error('crypto.getRandomValues() not supported. See https://github.com/uuidjs/uuid#getrandomvalues-not-supported');
+    }
+  }
+
+  return getRandomValues(rnds8);
+}
+},{}],44:[function(require,module,exports){
+"use strict";
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = void 0;
+
+// Adapted from Chris Veness' SHA1 code at
+// http://www.movable-type.co.uk/scripts/sha1.html
+function f(s, x, y, z) {
+  switch (s) {
+    case 0:
+      return x & y ^ ~x & z;
+
+    case 1:
+      return x ^ y ^ z;
+
+    case 2:
+      return x & y ^ x & z ^ y & z;
+
+    case 3:
+      return x ^ y ^ z;
+  }
+}
+
+function ROTL(x, n) {
+  return x << n | x >>> 32 - n;
+}
+
+function sha1(bytes) {
+  const K = [0x5a827999, 0x6ed9eba1, 0x8f1bbcdc, 0xca62c1d6];
+  const H = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
+
+  if (typeof bytes === 'string') {
+    const msg = unescape(encodeURIComponent(bytes)); // UTF8 escape
+
+    bytes = [];
+
+    for (let i = 0; i < msg.length; ++i) {
+      bytes.push(msg.charCodeAt(i));
+    }
+  } else if (!Array.isArray(bytes)) {
+    // Convert Array-like to Array
+    bytes = Array.prototype.slice.call(bytes);
+  }
+
+  bytes.push(0x80);
+  const l = bytes.length / 4 + 2;
+  const N = Math.ceil(l / 16);
+  const M = new Array(N);
+
+  for (let i = 0; i < N; ++i) {
+    const arr = new Uint32Array(16);
+
+    for (let j = 0; j < 16; ++j) {
+      arr[j] = bytes[i * 64 + j * 4] << 24 | bytes[i * 64 + j * 4 + 1] << 16 | bytes[i * 64 + j * 4 + 2] << 8 | bytes[i * 64 + j * 4 + 3];
+    }
+
+    M[i] = arr;
+  }
+
+  M[N - 1][14] = (bytes.length - 1) * 8 / Math.pow(2, 32);
+  M[N - 1][14] = Math.floor(M[N - 1][14]);
+  M[N - 1][15] = (bytes.length - 1) * 8 & 0xffffffff;
+
+  for (let i = 0; i < N; ++i) {
+    const W = new Uint32Array(80);
+
+    for (let t = 0; t < 16; ++t) {
+      W[t] = M[i][t];
+    }
+
+    for (let t = 16; t < 80; ++t) {
+      W[t] = ROTL(W[t - 3] ^ W[t - 8] ^ W[t - 14] ^ W[t - 16], 1);
+    }
+
+    let a = H[0];
+    let b = H[1];
+    let c = H[2];
+    let d = H[3];
+    let e = H[4];
+
+    for (let t = 0; t < 80; ++t) {
+      const s = Math.floor(t / 20);
+      const T = ROTL(a, 5) + f(s, b, c, d) + e + K[s] + W[t] >>> 0;
+      e = d;
+      d = c;
+      c = ROTL(b, 30) >>> 0;
+      b = a;
+      a = T;
+    }
+
+    H[0] = H[0] + a >>> 0;
+    H[1] = H[1] + b >>> 0;
+    H[2] = H[2] + c >>> 0;
+    H[3] = H[3] + d >>> 0;
+    H[4] = H[4] + e >>> 0;
+  }
+
+  return [H[0] >> 24 & 0xff, H[0] >> 16 & 0xff, H[0] >> 8 & 0xff, H[0] & 0xff, H[1] >> 24 & 0xff, H[1] >> 16 & 0xff, H[1] >> 8 & 0xff, H[1] & 0xff, H[2] >> 24 & 0xff, H[2] >> 16 & 0xff, H[2] >> 8 & 0xff, H[2] & 0xff, H[3] >> 24 & 0xff, H[3] >> 16 & 0xff, H[3] >> 8 & 0xff, H[3] & 0xff, H[4] >> 24 & 0xff, H[4] >> 16 & 0xff, H[4] >> 8 & 0xff, H[4] & 0xff];
+}
+
+var _default = sha1;
+exports.default = _default;
+},{}],45:[function(require,module,exports){
+"use strict";
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = void 0;
+
+var _validate = _interopRequireDefault(require("./validate.js"));
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+/**
+ * Convert array of 16 byte values to UUID string format of the form:
+ * XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX
+ */
+const byteToHex = [];
+
+for (let i = 0; i < 256; ++i) {
+  byteToHex.push((i + 0x100).toString(16).substr(1));
+}
+
+function stringify(arr, offset = 0) {
+  // Note: Be careful editing this code!  It's been tuned for performance
+  // and works in ways you may not expect. See https://github.com/uuidjs/uuid/pull/434
+  const uuid = (byteToHex[arr[offset + 0]] + byteToHex[arr[offset + 1]] + byteToHex[arr[offset + 2]] + byteToHex[arr[offset + 3]] + '-' + byteToHex[arr[offset + 4]] + byteToHex[arr[offset + 5]] + '-' + byteToHex[arr[offset + 6]] + byteToHex[arr[offset + 7]] + '-' + byteToHex[arr[offset + 8]] + byteToHex[arr[offset + 9]] + '-' + byteToHex[arr[offset + 10]] + byteToHex[arr[offset + 11]] + byteToHex[arr[offset + 12]] + byteToHex[arr[offset + 13]] + byteToHex[arr[offset + 14]] + byteToHex[arr[offset + 15]]).toLowerCase(); // Consistency check for valid UUID.  If this throws, it's likely due to one
+  // of the following:
+  // - One or more input array values don't map to a hex octet (leading to
+  // "undefined" in the uuid)
+  // - Invalid input values for the RFC `version` or `variant` fields
+
+  if (!(0, _validate.default)(uuid)) {
+    throw TypeError('Stringified UUID is invalid');
+  }
+
+  return uuid;
+}
+
+var _default = stringify;
+exports.default = _default;
+},{"./validate.js":51}],46:[function(require,module,exports){
+"use strict";
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = void 0;
+
+var _rng = _interopRequireDefault(require("./rng.js"));
+
+var _stringify = _interopRequireDefault(require("./stringify.js"));
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+// **`v1()` - Generate time-based UUID**
+//
+// Inspired by https://github.com/LiosK/UUID.js
+// and http://docs.python.org/library/uuid.html
+let _nodeId;
+
+let _clockseq; // Previous uuid creation time
+
+
+let _lastMSecs = 0;
+let _lastNSecs = 0; // See https://github.com/uuidjs/uuid for API details
+
+function v1(options, buf, offset) {
+  let i = buf && offset || 0;
+  const b = buf || new Array(16);
+  options = options || {};
+  let node = options.node || _nodeId;
+  let clockseq = options.clockseq !== undefined ? options.clockseq : _clockseq; // node and clockseq need to be initialized to random values if they're not
+  // specified.  We do this lazily to minimize issues related to insufficient
+  // system entropy.  See #189
+
+  if (node == null || clockseq == null) {
+    const seedBytes = options.random || (options.rng || _rng.default)();
+
+    if (node == null) {
+      // Per 4.5, create and 48-bit node id, (47 random bits + multicast bit = 1)
+      node = _nodeId = [seedBytes[0] | 0x01, seedBytes[1], seedBytes[2], seedBytes[3], seedBytes[4], seedBytes[5]];
+    }
+
+    if (clockseq == null) {
+      // Per 4.2.2, randomize (14 bit) clockseq
+      clockseq = _clockseq = (seedBytes[6] << 8 | seedBytes[7]) & 0x3fff;
+    }
+  } // UUID timestamps are 100 nano-second units since the Gregorian epoch,
+  // (1582-10-15 00:00).  JSNumbers aren't precise enough for this, so
+  // time is handled internally as 'msecs' (integer milliseconds) and 'nsecs'
+  // (100-nanoseconds offset from msecs) since unix epoch, 1970-01-01 00:00.
+
+
+  let msecs = options.msecs !== undefined ? options.msecs : Date.now(); // Per 4.2.1.2, use count of uuid's generated during the current clock
+  // cycle to simulate higher resolution clock
+
+  let nsecs = options.nsecs !== undefined ? options.nsecs : _lastNSecs + 1; // Time since last uuid creation (in msecs)
+
+  const dt = msecs - _lastMSecs + (nsecs - _lastNSecs) / 10000; // Per 4.2.1.2, Bump clockseq on clock regression
+
+  if (dt < 0 && options.clockseq === undefined) {
+    clockseq = clockseq + 1 & 0x3fff;
+  } // Reset nsecs if clock regresses (new clockseq) or we've moved onto a new
+  // time interval
+
+
+  if ((dt < 0 || msecs > _lastMSecs) && options.nsecs === undefined) {
+    nsecs = 0;
+  } // Per 4.2.1.2 Throw error if too many uuids are requested
+
+
+  if (nsecs >= 10000) {
+    throw new Error("uuid.v1(): Can't create more than 10M uuids/sec");
+  }
+
+  _lastMSecs = msecs;
+  _lastNSecs = nsecs;
+  _clockseq = clockseq; // Per 4.1.4 - Convert from unix epoch to Gregorian epoch
+
+  msecs += 12219292800000; // `time_low`
+
+  const tl = ((msecs & 0xfffffff) * 10000 + nsecs) % 0x100000000;
+  b[i++] = tl >>> 24 & 0xff;
+  b[i++] = tl >>> 16 & 0xff;
+  b[i++] = tl >>> 8 & 0xff;
+  b[i++] = tl & 0xff; // `time_mid`
+
+  const tmh = msecs / 0x100000000 * 10000 & 0xfffffff;
+  b[i++] = tmh >>> 8 & 0xff;
+  b[i++] = tmh & 0xff; // `time_high_and_version`
+
+  b[i++] = tmh >>> 24 & 0xf | 0x10; // include version
+
+  b[i++] = tmh >>> 16 & 0xff; // `clock_seq_hi_and_reserved` (Per 4.2.2 - include variant)
+
+  b[i++] = clockseq >>> 8 | 0x80; // `clock_seq_low`
+
+  b[i++] = clockseq & 0xff; // `node`
+
+  for (let n = 0; n < 6; ++n) {
+    b[i + n] = node[n];
+  }
+
+  return buf || (0, _stringify.default)(b);
+}
+
+var _default = v1;
+exports.default = _default;
+},{"./rng.js":43,"./stringify.js":45}],47:[function(require,module,exports){
+"use strict";
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = void 0;
+
+var _v = _interopRequireDefault(require("./v35.js"));
+
+var _md = _interopRequireDefault(require("./md5.js"));
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+const v3 = (0, _v.default)('v3', 0x30, _md.default);
+var _default = v3;
+exports.default = _default;
+},{"./md5.js":39,"./v35.js":48}],48:[function(require,module,exports){
+"use strict";
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = _default;
+exports.URL = exports.DNS = void 0;
+
+var _stringify = _interopRequireDefault(require("./stringify.js"));
+
+var _parse = _interopRequireDefault(require("./parse.js"));
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+function stringToBytes(str) {
+  str = unescape(encodeURIComponent(str)); // UTF8 escape
+
+  const bytes = [];
+
+  for (let i = 0; i < str.length; ++i) {
+    bytes.push(str.charCodeAt(i));
+  }
+
+  return bytes;
+}
+
+const DNS = '6ba7b810-9dad-11d1-80b4-00c04fd430c8';
+exports.DNS = DNS;
+const URL = '6ba7b811-9dad-11d1-80b4-00c04fd430c8';
+exports.URL = URL;
+
+function _default(name, version, hashfunc) {
+  function generateUUID(value, namespace, buf, offset) {
+    if (typeof value === 'string') {
+      value = stringToBytes(value);
+    }
+
+    if (typeof namespace === 'string') {
+      namespace = (0, _parse.default)(namespace);
+    }
+
+    if (namespace.length !== 16) {
+      throw TypeError('Namespace must be array-like (16 iterable integer values, 0-255)');
+    } // Compute hash of namespace and value, Per 4.3
+    // Future: Use spread syntax when supported on all platforms, e.g. `bytes =
+    // hashfunc([...namespace, ... value])`
+
+
+    let bytes = new Uint8Array(16 + value.length);
+    bytes.set(namespace);
+    bytes.set(value, namespace.length);
+    bytes = hashfunc(bytes);
+    bytes[6] = bytes[6] & 0x0f | version;
+    bytes[8] = bytes[8] & 0x3f | 0x80;
+
+    if (buf) {
+      offset = offset || 0;
+
+      for (let i = 0; i < 16; ++i) {
+        buf[offset + i] = bytes[i];
+      }
+
+      return buf;
+    }
+
+    return (0, _stringify.default)(bytes);
+  } // Function#name is not settable on some platforms (#270)
+
+
+  try {
+    generateUUID.name = name; // eslint-disable-next-line no-empty
+  } catch (err) {} // For CommonJS default export support
+
+
+  generateUUID.DNS = DNS;
+  generateUUID.URL = URL;
+  return generateUUID;
+}
+},{"./parse.js":41,"./stringify.js":45}],49:[function(require,module,exports){
+"use strict";
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = void 0;
+
+var _rng = _interopRequireDefault(require("./rng.js"));
+
+var _stringify = _interopRequireDefault(require("./stringify.js"));
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+function v4(options, buf, offset) {
+  options = options || {};
+
+  const rnds = options.random || (options.rng || _rng.default)(); // Per 4.4, set bits for version and `clock_seq_hi_and_reserved`
+
+
+  rnds[6] = rnds[6] & 0x0f | 0x40;
+  rnds[8] = rnds[8] & 0x3f | 0x80; // Copy bytes to buffer, if provided
+
+  if (buf) {
+    offset = offset || 0;
+
+    for (let i = 0; i < 16; ++i) {
+      buf[offset + i] = rnds[i];
+    }
+
+    return buf;
+  }
+
+  return (0, _stringify.default)(rnds);
+}
+
+var _default = v4;
+exports.default = _default;
+},{"./rng.js":43,"./stringify.js":45}],50:[function(require,module,exports){
+"use strict";
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = void 0;
+
+var _v = _interopRequireDefault(require("./v35.js"));
+
+var _sha = _interopRequireDefault(require("./sha1.js"));
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+const v5 = (0, _v.default)('v5', 0x50, _sha.default);
+var _default = v5;
+exports.default = _default;
+},{"./sha1.js":44,"./v35.js":48}],51:[function(require,module,exports){
+"use strict";
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = void 0;
+
+var _regex = _interopRequireDefault(require("./regex.js"));
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+function validate(uuid) {
+  return typeof uuid === 'string' && _regex.default.test(uuid);
+}
+
+var _default = validate;
+exports.default = _default;
+},{"./regex.js":42}],52:[function(require,module,exports){
+"use strict";
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = void 0;
+
+var _validate = _interopRequireDefault(require("./validate.js"));
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+function version(uuid) {
+  if (!(0, _validate.default)(uuid)) {
+    throw TypeError('Invalid UUID');
+  }
+
+  return parseInt(uuid.substr(14, 1), 16);
+}
+
+var _default = version;
+exports.default = _default;
+},{"./validate.js":51}]},{},[3]);
